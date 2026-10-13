@@ -1,13 +1,19 @@
 #pragma once
 
-// Per-champion state survives between turns. Pick one stat and keep buying it.
+#include <optional>
+#include "plan.h"
+
+// Per-champion state survives between turns.
 class Bot {
     int chosen_stat = -1;
+    std::optional<Role> role_;
 
-    // Spend only on power shards of the randomly chosen stat.
-    void buy_items();
+    // This champion's plan role: its index in the ally handle order
+    // (plan.h slot space), FLEX when the slot table doesn't cover it.
+    Role role();
 
 public:
-    // Priorities: shop and recall, attack enemies in range, bank gems, then farm.
+    // Priorities: shop (spawn or dead), recall, attack enemies in range,
+    // bank gems at the econ bag-cap, then farm.
     void play_turn();
 };

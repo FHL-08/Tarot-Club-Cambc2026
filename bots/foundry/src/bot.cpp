@@ -3,8 +3,10 @@
 #include "bot.h"
 #include <array>
 #include <iostream>
+#include "econ.h"
 #include "ledger.h"
 #include "obs.h"
+#include "plan.h"
 #include "random.h"
 #include <cstdint>
 #include <span>
@@ -60,13 +62,23 @@ bool move_towards_closest(cambc::bitboard goals) {
     return step != me.position() && me.move_absolute(step);
 }
 
-void Bot::buy_items() {
-    auto& me = cambc::self();
-    const std::array items{cambc::item_type::power_shard_of_strength,
-        cambc::item_type::power_shard_of_focus, cambc::item_type::power_shard_of_health};
-    const auto item = items[chosen_stat];
-    const unsigned count = me.gold_count() / item.cost();
-    if (count && me.can_buy(item, count)) me.buy(item, count);
+Role Bot::role() {
+    if (role_) return *role_;
+    Role resolved = Role::FLEX;
+    try {
+        const Plan plan = Plan::decode(cambc::draft_memory);
+        const auto allies = cambc::champions(team::ally);
+        const auto& me = cambc::self();
+        for (std::uint8_t slot = 0; slot < allies.size(); ++slot)
+            if (allies[slot] == me) {
+                resolved = slot < plan.num_slots() ? plan.role_at(slot) : Role::FLEX;
+                break;
+            }
+    } catch (const std::exception&) {
+        // No decodable plan: FLEX is the safe default queue.
+    }
+    role_ = resolved;
+    return resolved;
 }
 
 // Make one basic attack if the target is already in attack range.
@@ -121,11 +133,23 @@ void Bot::play_turn() {
 
     auto& me = cambc::self();
 
-    // Passive respawn-ledger refresh: runs every turn so capture flips and
-    // respawns are observed even on dead or channelling turns. A snapshot
-    // failure must never cost the turn, so SDK errors are swallowed here.
+    // Shopping is legal on spawn tiles and while dead — econ runs before the
+    // alive check. Vision queries can fail on dead turns, so keep a minimal
+    // snapshot for the shop path then.
+    Obs obs;
     try {
-        ledger::observe(collect());
+        obs = collect();
+    } catch (const std::exception&) {
+        obs.round = cambc::round_number();
+        obs.self_gold = me.gold_count();
+    }
+    econ::maybe_buy(role(), obs);
+
+    // Passive respawn-ledger refresh on the same snapshot — runs even on dead
+    // or channelling turns so capture flips are never missed. A ledger error
+    // must not cost the turn, so SDK errors are swallowed here.
+    try {
+        ledger::observe(obs);
     } catch (const cambc::error& err) {
         std::cout << "LEDGER_ERR " << err.what() << '\n';
     }
@@ -135,10 +159,7 @@ void Bot::play_turn() {
         || (!me.can_move() && !me.can_attack()))
         return;
 
-    // Shop before leaving spawn.
     const bool at_spawn = cambc::map::spawn_region(team::ally).is_set(me.position());
-    if (at_spawn)
-        buy_items();
 
     // Recall immediately when badly hurt away from spawn.
     if (!at_spawn && me.health() < me.max_health() * 0.35f) {
@@ -151,14 +172,15 @@ void Bot::play_turn() {
         if (attack_if_in_range(enemy))
             return;
 
-    // Bank any carried gems before farming.
-    if (me.gem_count() > 0) {
+    // Bank once the bag crosses the econ cap (or the deadline forces it).
+    if (econ::should_tribute(obs)) {
         // Union all altar approach tiles: the field chooses the nearest reachable altar.
         cambc::bitboard goals;
         goals.clear();
         for (auto altar : cambc::map::altars().positions()) {
             if (distance(me.position(), altar) <= cambc::constants::submit_gems_range
                 && !cambc::vision::has_altar_lock(altar)) {
+                    std::cout << "econ: tribute r" << obs.round << " bag=" << me.gem_count() << '\n';
                     me.submit_gems(altar);
                     return;
                 }
