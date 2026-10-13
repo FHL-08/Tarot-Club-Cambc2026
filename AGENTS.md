@@ -36,7 +36,9 @@ Use this language when talking about the game and the repo:
 - `sdk/` — vendored cambc SDK (headers, language bindings, templates). Refreshed
   by `cambc init`; treat it as upstream — do not hand-edit.
 - `maps/` — the published competition map pool (9 `.map26a` files).
-- `docs/` — the exported game handbook. Facts of record for rules and API.
+- `docs/` — the exported game handbook (`GameRules.md`, `BotAPICpp.md`),
+  plus `docs/strategy.md` — the ratified base strategy (FOUNDRY) the
+  factory builds against. Briefs derive their `Contract:` from it.
 - `factory/` — the code factory: brief template, scripts, local run ledgers.
 - `tools/docs-mcp/` — stdio MCP server that answers rules/API lookups over docs/.
 - `cambc.toml` — project config (sdk version, enabled languages).
