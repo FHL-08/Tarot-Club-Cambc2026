@@ -92,6 +92,16 @@ truncates the match yields no stats. Run to completion for evidence.
 - Do not claim verification you didn't run. `--statistics` output is the
   evidence; paste the real numbers.
 
+## Comments — hard rule
+
+Comments carry reasoning, never narration. A comment is REQUIRED when code
+encodes a non-obvious game rule, timing subtlety, or fuel tradeoff — cite the
+mechanic (`// tribute ticks at owner turn end — starting turn counts`).
+A comment is FORBIDDEN when it restates what the code does, names the type
+again, or narrates control flow. If a comment could be replaced by a better
+identifier, write the identifier. Doc comments on internal functions are
+banned — the signature is the doc.
+
 ## Pull requests
 
 - Never open a PR unless asked (or dispatched by the factory).
