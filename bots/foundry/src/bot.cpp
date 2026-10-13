@@ -3,6 +3,8 @@
 #include "bot.h"
 #include <array>
 #include <iostream>
+#include "ledger.h"
+#include "obs.h"
 #include "random.h"
 #include <cstdint>
 #include <span>
@@ -118,6 +120,15 @@ void Bot::play_turn() {
     cambc::shared_memory.write(0, std::span{&round, 1});
 
     auto& me = cambc::self();
+
+    // Passive respawn-ledger refresh: runs every turn so capture flips and
+    // respawns are observed even on dead or channelling turns. A snapshot
+    // failure must never cost the turn, so SDK errors are swallowed here.
+    try {
+        ledger::observe(collect());
+    } catch (const cambc::error& err) {
+        std::cout << "LEDGER_ERR " << err.what() << '\n';
+    }
 
     // Leave channels running and skip turns where we cannot act.
     if (!me.is_alive() || me.is_recalling() || me.is_submitting_gems() || me.is_teleporting()
