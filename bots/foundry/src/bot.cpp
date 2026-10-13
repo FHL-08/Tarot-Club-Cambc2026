@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 #include "econ.h"
+#include "ledger.h"
 #include "obs.h"
 #include "plan.h"
 #include "random.h"
@@ -143,6 +144,15 @@ void Bot::play_turn() {
         obs.self_gold = me.gold_count();
     }
     econ::maybe_buy(role(), obs);
+
+    // Passive respawn-ledger refresh on the same snapshot — runs even on dead
+    // or channelling turns so capture flips are never missed. A ledger error
+    // must not cost the turn, so SDK errors are swallowed here.
+    try {
+        ledger::observe(obs);
+    } catch (const cambc::error& err) {
+        std::cout << "LEDGER_ERR " << err.what() << '\n';
+    }
 
     // Leave channels running and skip turns where we cannot act.
     if (!me.is_alive() || me.is_recalling() || me.is_submitting_gems() || me.is_teleporting()
