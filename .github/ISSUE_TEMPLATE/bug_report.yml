@@ -1,0 +1,38 @@
+name: Bug report
+description: Bot misbehavior, wrong rules assumptions, build/match tooling problems.
+title: "[Bug]: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: One problem per issue. Include the match command and
+        statistics output if it's a behavior bug.
+      placeholder: |
+        e.g. On `cambc run tarot starter-cpp --map lanes`, our ranged
+        champions walk instead of attacking on every third turn.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      validations:
+      required: true
+
+  - type: input
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Bot, map, and command that show it.
+      placeholder: bots/tarot @ abc1234, `./cambc.exe run tarot starter-cpp --map lanes`
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs / statistics / replay path
+      render: shell

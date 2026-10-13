@@ -1,0 +1,45 @@
+name: Factory task
+description: Hand a piece of work to the code factory — a bot feature, module, or refactor.
+title: "[factory]: "
+labels:
+  - factory:ready
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the outcome, not the implementation. The orchestrator decomposes
+        this into Factory-Briefs; you don't need to write them.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Observable end state — what should be true when this is done?
+      placeholder: |
+        e.g. bots/tarot drafts a pool-appropriate comp and writes a camp
+        assignment plan into draft memory.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why this, what it blocks, links to docs sections or prior runs.
+      placeholder: |
+        e.g. Depends on nothing. Draft memory format is the contract other
+        briefs build against — see docs/GameRules.md "Shared draft memory".
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints / non-goals
+      description: Hard limits — files it mustn't touch, rules it must respect.
+      placeholder: e.g. Must not modify sdk/ or other bots. Fuel budget is real.
+
+  - type: input
+    id: verify-hint
+    attributes:
+      label: How would you check it's done?
+      description: Optional hint for the orchestrator's Verify commands.
+      placeholder: e.g. builds + wins vs starter-cpp on expanse and rows

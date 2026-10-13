@@ -1,1 +1,10 @@
 cambc.exe
+.cambc/
+bots/*/.cambc/
+matches/
+replays/
+bots/*/build/
+bots/*/target/
+
+# Factory run ledgers (local-only)
+factory/runs/

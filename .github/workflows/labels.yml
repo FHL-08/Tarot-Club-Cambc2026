@@ -1,0 +1,63 @@
+name: Sync labels
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/labels.yml
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const managedLabels = [
+              // Factory lifecycle
+              { name: "factory:ready",    color: "0e8a16", description: "Ready for the orchestrator to pick up" },
+              { name: "factory:building", color: "1d76db", description: "Factory is actively building this" },
+              { name: "factory:review",   color: "fbca04", description: "Factory PR open, awaiting review/merge" },
+              { name: "factory:merged",   color: "6f42c1", description: "Factory run merged" },
+              { name: "factory:failed",   color: "d73a4a", description: "Factory run failed" },
+              { name: "factory:paused",   color: "e99695", description: "Factory run paused, needs a human decision" },
+              // Standard
+              { name: "bug",              color: "d73a4a", description: "Something is broken or behaving incorrectly" },
+              { name: "enhancement",      color: "a2eeef", description: "Requested improvement or new capability" },
+              { name: "needs-triage",     color: "fbca04", description: "Needs maintainer review" },
+              // Areas
+              { name: "draft",            color: "c5def5", description: "Draft phase: picks, draft memory" },
+              { name: "combat",           color: "f9d0c4", description: "Fighting: attacks, abilities, camps" },
+              { name: "economy",          color: "fef2c0", description: "Gems, gold, items, tributes" },
+              { name: "vision",           color: "d4c5f9", description: "Vision, wards, information flow" },
+              { name: "infra",            color: "ededed", description: "Factory, tooling, docs, CI" },
+            ];
+
+            for (const label of managedLabels) {
+              try {
+                const { data: existing } = await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                });
+                if (existing.color !== label.color ||
+                    (existing.description ?? "") !== label.description) {
+                  await github.rest.issues.updateLabel({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    name: label.name, color: label.color,
+                    description: label.description,
+                  });
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  name: label.name, color: label.color,
+                  description: label.description,
+                });
+              }
+            }
