@@ -5,9 +5,11 @@ matches/
 replays/
 bots/*/build/
 bots/*/target/
+maps/
 
 # Factory run ledgers (local-only)
 factory/runs/
 
 # Personal Configs 
 .vscode/ 
+sdk/
