@@ -13,7 +13,8 @@ compiled to WASI, fighting for gems on the competition map pool.
 ```
 
 - **Docs**: `docs/GameRules.md` (rules + champions), `docs/BotAPICpp.md` (C++ API).
-- **Agents**: start at `AGENTS.md`; skills live in `.agents/skills/`.
+- **Agents**: start at `AGENTS.md`; skills and role profiles live in
+  `.agents/` (harness-agnostic — works with any agent tool).
 - **Factory**: issues labeled `factory:ready` get decomposed, built in
   worktrees, verified by real matches, and merged through
   `factory/scripts/merge-gate.sh`. See `factory/brief-template.md`.

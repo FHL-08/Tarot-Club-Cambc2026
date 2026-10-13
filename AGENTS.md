@@ -103,8 +103,14 @@ truncates the match yields no stats. Run to completion for evidence.
 
 This repo is built by an orchestrated fleet of agents ("the factory"). The
 operating contract lives in `.agents/skills/factory-orchestrator` and
-`.agents/skills/factory-worker`; scripts in `factory/scripts/`; agent profiles
-in `.devin/agents/`.
+`.agents/skills/factory-worker`; scripts in `factory/scripts/`; role profiles
+(worker, verifier, scout, reviewer) in `.agents/profiles/`.
+
+Everything under `.agents/` is harness-agnostic — skills and profiles are
+plain markdown any agent can read. A harness that wants to register the
+profiles natively can symlink them (e.g. Claude Code → `.claude/agents/`,
+Devin → `.devin/agents/`); otherwise the orchestrator inlines the profile
+text into the subagent prompt it dispatches.
 
 - Work is decomposed into briefs (`factory/brief-template.md`): contract-first,
   disjoint `Files:` scopes, real `Verify:` commands. Briefs live on GitHub
