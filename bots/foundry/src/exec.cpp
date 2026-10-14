@@ -267,6 +267,109 @@ std::int64_t dist_to(const GroupGeo& g, cambc::vec2 p)
     return best;
 }
 
+// Grouped-opening stop order (issue #38): every body must derive the SAME
+// chain — wire.h is full, so no shared-memory consensus can arbitrate a
+// disagreement. Every input is static and shared across instances: map
+// data (camp_groups, member base stats, a hard-terrain distance field
+// from our spawn region) and the draft record for the clear estimate —
+// summing per-body my_dps() would feed each body's own kit in and could
+// split the chain. Ties break to the lowest group index. Elks and
+// monoliths are excluded: elks are haulable single units, not group
+// fights, and monolith tiles never open up.
+// The chain extends lazily, one stop per index: each step costs a fresh
+// distance field, and the round-1 fast path can only afford stop 0 inside
+// the 2x budget — later stops get priced into normal-budget turns.
+int opening_stop(int index)
+{
+    static std::vector<int> stops;
+    static std::vector<char> used;
+    static cambc::bitboard origin;
+    static bool seeded = false, exhausted = false;
+    const auto& geos = groups();
+    if (!seeded)
+    {
+        used.assign(geos.size(), 0);
+        origin = cambc::map::spawn_region(cambc::team::ally);
+        seeded = true;
+    }
+    // Whole-team clear estimate: the opening bodies fight together, so the
+    // pack's health is priced in team-damage rounds. The sum runs over the
+    // ally draft record — static and identical for every body — using only
+    // each type's basic term (base_strength × camp_damage_multiplier,
+    // matching my_dps()'s basic component; the per-body ability burst probe
+    // stays out so kits can't skew the estimate). cassi_and_issac is one
+    // pick but two bodies.
+    static const float team_dps = [] {
+        float total = 0;
+        for (const auto pick : cambc::draft::current_draft(cambc::team::ally))
+        {
+            const auto add = [&](cambc::champion_type type) {
+                const auto stats = cambc::champion(type).base_stats();
+                total += stats.base_strength * stats.camp_damage_multiplier;
+            };
+            if (pick == cambc::champion_draft::cassi_and_issac)
+            {
+                add(cambc::champion_type::cassi);
+                add(cambc::champion_type::issac);
+            }
+            else
+            {
+                const auto raw = static_cast<std::int32_t>(pick);
+                add(static_cast<cambc::champion_type>(
+                    raw + (raw > static_cast<std::int32_t>(cambc::champion_draft::cassi_and_issac) ? 1 : 0)));
+            }
+        }
+        return std::max(total, 1.0f);
+    }();
+    static const auto raw = cambc::map::camp_groups();
+    static const auto hard = cambc::map::walls() | cambc::map::holes()
+        | cambc::map::altars() | cambc::map::spawn_region(cambc::team::enemy);
+    while (static_cast<int>(stops.size()) <= index && !exhausted)
+    {
+        cambc::distance_field field;
+        cambc::bitboard visited;
+        field.compute(hard, origin, visited);
+        int best = -1;
+        float best_score = -1;
+        for (std::size_t g = 0; g < geos.size(); ++g)
+        {
+            if (used[g] || geos[g].gems <= 0 || geos[g].monolith) continue;
+            bool elk = false;
+            for (const auto& member : raw[g])
+                if (member.is_elk()) { elk = true; break; }
+            if (elk) continue;
+            std::uint16_t travel = cambc::distance_field::unreachable;
+            for (const auto tile : geos[g].tile_list)
+                travel = std::min(travel, field.get(tile));
+            if (travel == cambc::distance_field::unreachable) continue;
+            const float clear = geos[g].health / team_dps;
+            const float score = static_cast<float>(geos[g].gems)
+                / (static_cast<float>(travel) + clear);
+            if (score > best_score) { best_score = score; best = static_cast<int>(g); }
+        }
+        if (best < 0) { exhausted = true; break; }
+        used[static_cast<std::size_t>(best)] = 1;
+        stops.push_back(best);
+        origin = geos[best].tiles;
+    }
+    return static_cast<int>(stops.size()) > index ? stops[index] : -1;
+}
+
+const std::vector<int>& opening_stops()
+{
+    static const std::vector<int> stops = [] {
+        std::vector<int> out;
+        for (int s = 0; s < 3; ++s)
+        {
+            const int g = opening_stop(s);
+            if (g < 0) break;
+            out.push_back(g);
+        }
+        return out;
+    }();
+    return stops;
+}
+
 bool enemy_on(int g, const Obs& obs)
 {
     for (const auto& e : obs.enemies)
@@ -402,8 +505,29 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     using cs = cambc::champion_state;
     const auto st = obs.self_state;
     my_slot();
-    bind_plan(plan);
     mem.nav_pending = -1;
+
+    // Round-1 fast path: a turn that overruns its fuel resumes on the next
+    // round and only then commits the buffered action (GameRules §fuel) —
+    // the full tick first-call (collect's vision scans plus every static
+    // cache below) pushed first moves to round 2-3 while starters act on
+    // round 1. Build just the opening chain here and travel straight at
+    // stop 0's capture tiles; normal routing takes over from round 2.
+    if (obs.round <= 1)
+    {
+        const int g0 = opening_stop(0);
+        if (g0 >= 0)
+        {
+            const auto free_tiles = groups()[g0].tiles & ~blocked_tiles();
+            if (!free_tiles.is_empty())
+            {
+                mem.nav_pending = g0;
+                return done(State::travel, Move{ std::move(free_tiles) }, obs);
+            }
+        }
+    }
+
+    bind_plan(plan);
 
     // Mid-channel turns can't act — tribute/recall/teleport continue alone.
     if (st.contains(cs::submitting_gems) || st.contains(cs::recalling) || st.contains(cs::teleporting)
@@ -777,33 +901,109 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         for (std::size_t g = 0; g < geos.size(); ++g)
             if (mine(static_cast<int>(g))) consider(static_cast<int>(g), -1, relaxed);
     };
-    scan(false);
-    // Desperation pass: a body that owns zero fit gem camps (elkring,
-    // rows — every pack above the solo floor) can't sit on 0-gem gold or
-    // idle forever; the tribute race is paid in gems, so it grinds the
-    // least-bad trap. Mixed-map bodies always own some fit supply — a
-    // respawn lull never reads as desperation.
-    const bool desperate = fit_gem_supply == 0;
-    if (desperate) { scanned = 0; scan(true); }
 
-    if (target < 0) { target = gold_target; target_reward = gold_reward; }
-    // An in-flight gold errand is preemptible the moment real work exists.
-    if (active_state && mem.active_target >= 0 && geos[mem.active_target].gems == 0 && target >= 0)
-        active_state = 0;
-
-    if (active_state)
+    // Grouped opening (issue #38): while the chain has an unfinished stop
+    // it overrides the route scan — the first gem packs are cleared
+    // together, which is where the platform openings were being lost.
+    // A stop is finished once the ledger marks it captured: a visible
+    // respawning state, or a captured/dead ready_at; an unseen stop whose
+    // ready_at still says "alive" is believed live and still owed a visit.
+    if (obs.round <= 90)
     {
-        // Commit until done unless a gem rival clearly outranks: a pending
-        // capture beats a live-camp errand, and a respawned camp eight
-        // tiles closer beats the walk. 1-3 tile margins still dither on
-        // Voronoi boundaries — the threshold must exceed the flip band.
-        const bool rival = target >= 0 && geos[target].gems > 0
-            && ((target_reward && active_state == 1)
-                || (target_reward == (active_state == 2) && target_cost + 8 < active_cost));
-        if (target < 0 || !rival)
+        const auto open_stop = [&](int after) -> int {
+            const auto& chain = opening_stops();
+            for (std::size_t i = static_cast<std::size_t>(after) + 1; i < chain.size(); ++i)
+            {
+                const int g = chain[i];
+                if (const CampObs* c = seen(obs, g))
+                {
+                    if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state))
+                        continue;
+                    return static_cast<int>(i);
+                }
+                const int ready = ledger::ready_round(g);
+                if (ready == ledger::never || ready > static_cast<int>(obs.round))
+                    continue;
+                return static_cast<int>(i);
+            }
+            return -1;
+        };
+        for (int oi = open_stop(-1); oi >= 0; oi = open_stop(oi))
         {
-            target = mem.active_target;
-            target_reward = active_state == 2;
+            const int g = opening_stops()[oi];
+            const CampObs* c = seen(obs, g);
+            if (!c || !std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
+            {
+                target = g;
+                break;
+            }
+            // One body stands on a pending reward; the rest walk to the
+            // next stop. Nearest to a free capture tile wins (ties: the
+            // lower ally slot). Ally position reads are vision-gated —
+            // any throw means the roster can't be arbitrated, so this
+            // body captures itself.
+            const auto free_tiles = geos[g].tiles & ~blocked;
+            const auto dist_free = [&](cambc::vec2 p) {
+                std::int64_t best = std::numeric_limits<std::int64_t>::max();
+                for (const auto t : free_tiles.positions())
+                    best = std::min(best, p.chebyshev_distance(t));
+                return best;
+            };
+            bool stands = !free_tiles.is_empty();
+            if (stands && !free_tiles.is_set(pos))
+            {
+                const auto mine_d = dist_free(pos);
+                try
+                {
+                    const auto allies = cambc::champions(cambc::team::ally);
+                    const auto& me = cambc::self();
+                    for (std::size_t i = 0; i < allies.size() && stands; ++i)
+                    {
+                        if (allies[i] == me) continue;
+                        const auto d = dist_free(allies[i].position());
+                        if (d < mine_d || (d == mine_d && static_cast<int>(i) < mem.slot))
+                            stands = false;
+                    }
+                }
+                catch (const cambc::error&) { }
+            }
+            if (!stands) continue; // next open stop, or fall to solo logic
+            mem.nav_pending = g;
+            return done(State::travel, Move{ free_tiles }, obs);
+        }
+    }
+
+    bool desperate = false;
+    if (target < 0)
+    {
+        scan(false);
+        // Desperation pass: a body that owns zero fit gem camps (elkring,
+        // rows — every pack above the solo floor) can't sit on 0-gem gold or
+        // idle forever; the tribute race is paid in gems, so it grinds the
+        // least-bad trap. Mixed-map bodies always own some fit supply — a
+        // respawn lull never reads as desperation.
+        desperate = fit_gem_supply == 0;
+        if (desperate) { scanned = 0; scan(true); }
+
+        if (target < 0) { target = gold_target; target_reward = gold_reward; }
+        // An in-flight gold errand is preemptible the moment real work exists.
+        if (active_state && mem.active_target >= 0 && geos[mem.active_target].gems == 0 && target >= 0)
+            active_state = 0;
+
+        if (active_state)
+        {
+            // Commit until done unless a gem rival clearly outranks: a pending
+            // capture beats a live-camp errand, and a respawned camp eight
+            // tiles closer beats the walk. 1-3 tile margins still dither on
+            // Voronoi boundaries — the threshold must exceed the flip band.
+            const bool rival = target >= 0 && geos[target].gems > 0
+                && ((target_reward && active_state == 1)
+                    || (target_reward == (active_state == 2) && target_cost + 8 < active_cost));
+            if (target < 0 || !rival)
+            {
+                target = mem.active_target;
+                target_reward = active_state == 2;
+            }
         }
     }
     mem.active_target = target;
