@@ -57,8 +57,9 @@ constexpr std::uint32_t strike_cooldown = 200;
 // lands its last hit already past the bail line.
 constexpr float retreat_floor = 0.40f;
 
-// Shop trip: enough gold for a full Power emblem (6 shards × 30g) sends an
-// unthreatened, light-bagged champion home to spend — routes otherwise
+// Shop trip: a full emblem (five 30g shards — Power counts as six shards'
+// worth) plus a lock/crystal restock sends an unthreatened, light-bagged
+// champion home to spend — routes otherwise
 // never revisit spawn except on low HP, leaving hundreds banked (#34).
 // Tavi shops in the field (GameRules: Tavi buys shards anywhere), so it
 // never takes the trip.
