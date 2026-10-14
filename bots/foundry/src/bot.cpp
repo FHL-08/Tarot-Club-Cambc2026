@@ -43,9 +43,9 @@ const Plan& Bot::plan() {
 void Bot::play_turn() {
     auto& me = cambc::self();
 
-    // Shopping is legal on spawn tiles and while dead — econ runs before the
-    // alive check. Vision queries can fail on dead turns, so keep a minimal
-    // snapshot for the shop path then.
+    // Shopping is legal on spawn tiles and while dead — econ runs even when
+    // nothing else can. Vision queries can fail on dead turns, so keep a
+    // minimal snapshot for the shop path then.
     Obs obs;
     try {
         obs = collect();
@@ -53,7 +53,6 @@ void Bot::play_turn() {
         obs.round = cambc::round_number();
         obs.self_gold = me.gold_count();
     }
-    econ::maybe_buy(role(), obs);
 
     // Passive respawn-ledger refresh on the same snapshot — runs even on dead
     // or channelling turns so capture flips are never missed. A ledger error
@@ -64,9 +63,12 @@ void Bot::play_turn() {
         std::cout << "LEDGER_ERR " << err.what() << '\n';
     }
 
-    if (!me.is_alive()) return;
+    // Econ runs AFTER the action: the first turn collects ~64k and the
+    // first econ call another ~100k of the 2× budget, so shopping before
+    // acting starved tick's fuel and the body never moved on round 1.
+    if (me.is_alive()) exec::apply(exec::tick(obs, plan()));
 
-    exec::apply(exec::tick(obs, plan()));
+    econ::maybe_buy(role(), obs);
 
     me.set_priority(1 + random_number(100));
 }
