@@ -98,14 +98,6 @@ struct Mem {
     std::optional<cambc::champion> twin;
     int twin_slot = -1;
     bool follower = false;
-    cambc::vec2 twin_last{ -1, -1 };  // last readable twin position
-    std::uint32_t twin_last_round = 0;
-    // Pair stall watchdogs: separation rounds since the twins were last
-    // adjacent; when no approach lands, the leash/follow releases so a
-    // trapped twin can't park the pair for the whole match.
-    std::int32_t pair_stall = -1;
-    std::uint32_t divorced_until = 0;
-    bool leash_on = true;
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
     // Compiled-plan binding, filled once from the draft blob. `route` is a
     // view into the Bot-held Plan — both stay valid for the whole match.
@@ -645,8 +637,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             twin_max_health = tw.max_health();
             twin_ok = true;
             twin_alive = twin_health > 0;
-            mem.twin_last = twin_pos;
-            mem.twin_last_round = obs.round;
         }
         catch (const cambc::error&) { }
     }
@@ -765,167 +755,98 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     }
 
     // Follower branch (issue #36): with Issac readable and alive, Cassi
-    // gives up her own target scan and shadows him. Camp aggro is the
-    // driver — every monster has range 3 and attacks the NEAREST champion
-    // (GameRules §Camps), so she only swings when Issac is strictly closer
-    // to each member she could reach, and otherwise kites to a tile that
-    // keeps him nearest. An unreadable twin falls through to solo logic,
-    // which still converges on the pair's shared route and union share.
-    // Leader leash: vision-gated reads mean Cassi can only follow while
-    // Issac is inside ~8 tiles, and both move one tile a round — if he
-    // advances while she's outside the leash the gap never closes. So he
-    // holds whenever she isn't within 3: unreadable either means out of
-    // vision (she's homing on his last position) or dead — and her death
-    // is his (GameRules §Cassi and Issac), so holding is never wrong. If
-    // no approach lands for ~25 rounds she is trapped (pocket geometry or
-    // a blocked ring): holding would starve the game, so the leash
-    // releases until the twins are adjacent again.
-    if (mem.twin && !mem.follower)
+    // fights off his engage instead of running her own scan. Camp aggro
+    // is the driver — every monster has range 3 and attacks the NEAREST
+    // champion (GameRules §Camps), so she only swings when Issac is
+    // strictly closer to each member she could reach, and otherwise
+    // kites to a tile that keeps him nearest. An unreadable twin — or no
+    // engaged group near him — falls through to solo logic, which still
+    // converges on the pair's shared route and union share.
+    if (mem.follower && mem.twin && twin_alive)
     {
-        // Readable again (inside her vision range) means she can close —
-        // re-arm the leash; if she fails to close in ~25 rounds the
-        // watchdog releases it again.
-        if (twin_ok) { mem.leash_on = true; if (pos.chebyshev_distance(twin_pos) <= 2) mem.pair_stall = -1; }
-        const bool separated = !twin_alive || pos.chebyshev_distance(twin_pos) > 3;
-        if (separated && mem.leash_on)
+        const cambc::vec2 lp = twin_pos;
+        // Engaged group: the group owning the live member nearest Issac
+        // within monster range (ties to the lower index).
+        int engaged = -1;
+        std::int64_t eng_d = std::numeric_limits<std::int64_t>::max();
+        for (const auto& c : visible_camps())
         {
-            if (mem.pair_stall < 0) mem.pair_stall = obs.round;
-            else if (obs.round - mem.pair_stall > 25)
-            { mem.leash_on = false; mem.pair_stall = -1; }
-            else return done(State::clear, Wait{}, obs);
+            if (c.health() <= 0) continue;
+            const int g = group_of(c.spawn_position());
+            if (g < 0) continue;
+            const auto d = c.position().chebyshev_distance(lp);
+            if (d <= 3 && (d < eng_d || (d == eng_d && g < engaged)))
+            { eng_d = d; engaged = g; }
         }
-        else if (!separated) mem.pair_stall = -1;
-    }
-
-    if (mem.follower && mem.twin)
-    {
-        // Same watchdog on her side: adjacent again clears it, otherwise
-        // 25 rounds without a read/close means solo work for 60.
-        if (twin_ok && pos.chebyshev_distance(twin_pos) <= 2)
-            mem.pair_stall = -1;
-        else if (mem.pair_stall < 0)
-            mem.pair_stall = obs.round;
-        else if (obs.round - mem.pair_stall > 25)
-        { mem.divorced_until = obs.round + 60; mem.pair_stall = -1; }
-    }
-
-    if (mem.follower && mem.twin && obs.round >= mem.divorced_until)
-    {
-
-        // Twin unreadable (out of vision or dead — linked fate means her
-        // own survival tracks his): keep closing on the last readable
-        // position so the pair re-rendezvous on the shared route instead
-        // of drifting onto separate union-share camps.
-        if (!twin_alive && mem.twin_last.x >= 0
-            && pos.chebyshev_distance(mem.twin_last) > 2)
+        if (engaged < 0)
         {
-            cambc::bitboard last{ cambc::uninitialized };
-            last.draw_chebyshev(mem.twin_last, 2);
-            last &= ~blocked;
-            if (!last.is_empty())
-                return done(State::travel, Move{ std::move(last) }, obs);
-        }
-        if (twin_alive)
-        {
-            const cambc::vec2 lp = twin_pos;
+            // A capturable reward beside Issac still gets her assist —
+            // but an ally already on its tiles owns the stand.
+            for (std::size_t g = 0; g < geos.size(); ++g)
             {
-                // Engaged group: the group owning the live member nearest
-
-                // Issac within monster range (ties to the lower index).
-                int engaged = -1;
-                std::int64_t eng_d = std::numeric_limits<std::int64_t>::max();
-                for (const auto& c : visible_camps())
-                {
-                    if (c.health() <= 0) continue;
-                    const int g = group_of(c.spawn_position());
-                    if (g < 0) continue;
-                    const auto d = c.position().chebyshev_distance(lp);
-                    if (d <= 3 && (d < eng_d || (d == eng_d && g < engaged)))
-                    { eng_d = d; engaged = g; }
-                }
-                // Stand-by tiles: free tiles within 2 of Issac plus his
-                // own tile (nav clears self from goals, so a ring-only
-                // goal set cannot represent "step onto his tile last");
-                // already inside means hold.
-                const auto shadow_or_wait = [&]() -> exec::Action {
-                    const auto d = pos.chebyshev_distance(lp);
-                    if (d <= 2) return Wait{};
-                    cambc::bitboard near2{ cambc::uninitialized };
-                    near2.draw_chebyshev(lp, 2);
-                    near2 &= ~blocked;
-                    near2.set(lp, true);
-                    return exec::Action{ Move{ std::move(near2) } };
-                };
-                if (engaged < 0)
-                {
-                    // A capturable reward beside Issac outranks shadowing —
-                    // but an ally already on its tiles owns the stand.
-                    for (std::size_t g = 0; g < geos.size(); ++g)
-                    {
-                        const CampObs* c = seen(obs, static_cast<int>(g));
-                        if (!c || !std::holds_alternative<cambc::map::camp_group_reward_available>(c->state)
-                            || dist_to(geos[g], lp) > 3)
-                            continue;
-                        auto occupied = cambc::vision::champion_tiles(cambc::team::ally)
-                            & geos[g].tiles;
-                        occupied.set(pos, false);
-                        if (!occupied.is_empty()) continue;
-                        // Standing on the group already counts toward the
-                        // capture — moving to another goal tile would reset
-                        // it (and nav clears self from goals, so a 2-tile
-                        // goal set flip-flops forever).
-                        if (geos[g].tiles.is_set(pos))
-                            return done(State::capture, Wait{}, obs);
-                        auto free_tiles = geos[g].tiles & ~blocked;
-                        if (!free_tiles.is_empty())
-                            return done(State::capture, Move{ std::move(free_tiles) }, obs);
-                    }
-                    return done(State::clear, shadow_or_wait(), obs);
-                }
-                std::vector<cambc::camp> members;
-                for (const auto& c : visible_camps())
-                    if (c.health() > 0 && group_of(c.spawn_position()) == engaged)
-                        members.push_back(c);
-                // Aggro check: monsters attack the nearest champion, so a
-                // swing is safe only while Issac is strictly nearer to
-                // every live member that could retaliate onto her.
-                bool aggro_safe = !members.empty();
-                for (const auto& m : members)
-                {
-                    const auto d_c = pos.chebyshev_distance(m.position());
-                    const auto d_l = lp.chebyshev_distance(m.position());
-                    if (d_c <= 3 && d_l >= d_c) aggro_safe = false;
-                }
-                if (aggro_safe)
-                {
-                    if (const auto cast = camp_cast(engaged, obs.round))
-                        return done(State::clear, *cast, obs);
-                    const auto attack_tiles = cambc::self().attack_tiles();
-                    if (const auto hit = attack_in_range(attack_tiles, engaged))
-                        return done(State::clear, *hit, obs);
-                }
-                // Kite window: in range of some member, strictly farther
-                // than Issac from every member, inside the 3-tile leash.
-                cambc::bitboard support{ cambc::uninitialized };
-                const auto atk_range = cambc::self().attack_range();
-                for (const auto& m : members)
-                    support.draw_chebyshev(m.position(), atk_range);
-                for (const auto& m : members)
-                {
-                    cambc::bitboard nearer{ cambc::uninitialized };
-                    nearer.draw_chebyshev(m.position(),
-                        static_cast<int>(lp.chebyshev_distance(m.position())));
-                    support &= ~nearer;
-                }
-                support &= ~blocked;
-                cambc::bitboard leash{ cambc::uninitialized };
-                leash.draw_chebyshev(lp, 3);
-                support &= leash;
-                if (support.is_set(pos)) return done(State::clear, Wait{}, obs);
-                if (!support.is_empty())
-                    return done(State::clear, Move{ std::move(support) }, obs);
-                return done(State::clear, shadow_or_wait(), obs);
+                const CampObs* c = seen(obs, static_cast<int>(g));
+                if (!c || !std::holds_alternative<cambc::map::camp_group_reward_available>(c->state)
+                    || dist_to(geos[g], lp) > 3)
+                    continue;
+                auto occupied = cambc::vision::champion_tiles(cambc::team::ally)
+                    & geos[g].tiles;
+                occupied.set(pos, false);
+                if (!occupied.is_empty()) continue;
+                // Standing on the group already counts toward the capture
+                // — moving to another goal tile would reset it (and nav
+                // clears self from goals, so a 2-tile goal set flip-flops
+                // forever).
+                if (geos[g].tiles.is_set(pos))
+                    return done(State::capture, Wait{}, obs);
+                auto free_tiles = geos[g].tiles & ~blocked;
+                if (!free_tiles.is_empty())
+                    return done(State::capture, Move{ std::move(free_tiles) }, obs);
             }
+        }
+        else
+        {
+            std::vector<cambc::camp> members;
+            for (const auto& c : visible_camps())
+                if (c.health() > 0 && group_of(c.spawn_position()) == engaged)
+                    members.push_back(c);
+            // Aggro check: monsters attack the nearest champion, so a
+            // swing is safe only while Issac is strictly nearer to every
+            // live member that could retaliate onto her.
+            bool aggro_safe = !members.empty();
+            for (const auto& m : members)
+            {
+                const auto d_c = pos.chebyshev_distance(m.position());
+                const auto d_l = lp.chebyshev_distance(m.position());
+                if (d_c <= 3 && d_l >= d_c) aggro_safe = false;
+            }
+            if (aggro_safe)
+            {
+                if (const auto cast = camp_cast(engaged, obs.round))
+                    return done(State::clear, *cast, obs);
+                const auto attack_tiles = cambc::self().attack_tiles();
+                if (const auto hit = attack_in_range(attack_tiles, engaged))
+                    return done(State::clear, *hit, obs);
+            }
+            // Kite window: in range of some member, strictly farther
+            // than Issac from every member, inside the 3-tile ring.
+            cambc::bitboard support{ cambc::uninitialized };
+            const auto atk_range = cambc::self().attack_range();
+            for (const auto& m : members)
+                support.draw_chebyshev(m.position(), atk_range);
+            for (const auto& m : members)
+            {
+                cambc::bitboard nearer{ cambc::uninitialized };
+                nearer.draw_chebyshev(m.position(),
+                    static_cast<int>(lp.chebyshev_distance(m.position())));
+                support &= ~nearer;
+            }
+            support &= ~blocked;
+            cambc::bitboard ring{ cambc::uninitialized };
+            ring.draw_chebyshev(lp, 3);
+            support &= ring;
+            if (support.is_set(pos)) return done(State::clear, Wait{}, obs);
+            if (!support.is_empty())
+                return done(State::clear, Move{ std::move(support) }, obs);
         }
     }
 
