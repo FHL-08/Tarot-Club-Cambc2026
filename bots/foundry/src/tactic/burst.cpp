@@ -17,6 +17,7 @@ struct Target {
     std::uint32_t gems = 0;
     bool channelling = false; // tribute or recall — pinned in place
     bool stunned = false;
+    float attack_range = 0; // read once — it can't change mid-turn
 };
 
 [[nodiscard]] float range_of(const cambc::ability& ab)
@@ -52,7 +53,7 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
             auto handle = cambc::vision::champion_at(e.position);
             targets.push_back({ handle, e.position, e.health, e.gems,
                 e.submitting || handle.is_recalling(),
-                handle.buffs().has_stun() });
+                handle.buffs().has_stun(), static_cast<float>(handle.attack_range()) });
         }
         catch (const cambc::error&) { continue; } // left vision between collect and now
     }
@@ -95,6 +96,21 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
             best_t = &anchor;
         }
     };
+    // damage_amount is a host call per (slot, enemy) — cache it for the
+    // turn; the 9-centre scan would otherwise re-price the same pair.
+    std::array<std::vector<float>, 2> dmg_cache{
+        std::vector<float>(targets.size(), -1.f),
+        std::vector<float>(targets.size(), -1.f) };
+    std::array<std::vector<char>, 2> dmg_bad{
+        std::vector<char>(targets.size(), 0),
+        std::vector<char>(targets.size(), 0) };
+    auto dmg_of = [&](std::uint32_t slot, std::size_t i) {
+        float& cached = dmg_cache[slot][i];
+        if (cached < 0 && !dmg_bad[slot][i])
+            try { cached = abilities[slot].damage_amount(targets[i].handle); }
+            catch (const cambc::error&) { dmg_bad[slot][i] = 1; }
+        return cached;
+    };
     for (std::uint32_t slot = 0; slot < 2; ++slot)
     {
         const auto& ab = abilities[slot];
@@ -104,12 +120,12 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
         cambc::bitboard reach{ cambc::uninitialized };
         ab.mask_into(reach);
         if (ab.can_target_enemies())
-            for (const auto& t : targets)
+            for (std::size_t i = 0; i < targets.size(); ++i)
             {
+                const auto& t = targets[i];
                 if (!reach.is_set(t.pos)) continue;
-                float dmg = 0;
-                try { dmg = ab.damage_amount(t.handle); }
-                catch (const cambc::error&) { continue; }
+                const float dmg = dmg_of(slot, i);
+                if (dmg_bad[slot][i]) continue;
                 consider(slot, t.pos, false, 1, dmg, t, cc && t.stunned);
             }
         if (ab.can_target_ground() && (aoe || cc))
@@ -127,15 +143,15 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
                         float dmg = 0;
                         bool all_stunned = true;
                         const Target* anchor = nullptr;
-                        for (const auto& e : targets)
+                        for (std::size_t i = 0; i < targets.size(); ++i)
                         {
+                            const auto& e = targets[i];
                             if (centre.chebyshev_distance(e.pos)
                                 > static_cast<std::int64_t>(radius))
                                 continue;
                             ++hits;
                             all_stunned = all_stunned && e.stunned;
-                            try { dmg += ab.damage_amount(e.handle); }
-                            catch (const cambc::error&) { }
+                            dmg += dmg_of(slot, i);
                             if (better_target(e, anchor)) anchor = &e;
                         }
                         if (hits > 0)
@@ -155,8 +171,7 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
         for (const auto& t : targets)
             try
             {
-                if (pos.chebyshev_distance(t.pos)
-                    <= t.handle.attack_range() + 1)
+                if (pos.chebyshev_distance(t.pos) <= t.attack_range + 1)
                     return true;
             }
             catch (const cambc::error&) { continue; }
