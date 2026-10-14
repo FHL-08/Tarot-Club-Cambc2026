@@ -95,9 +95,6 @@ void ledger::observe(const Obs& obs)
                 if (was == seen_state::reward && seen_last_round)
                 {
                     note_capture(seen.group, round);
-                    std::cout << "LEDGER predicted=" << e.predicted
-                              << " actual=" << implied
-                              << " group=" << static_cast<int>(seen.group) << '\n';
                 }
                 else if (e.predicted < 0)
                 {
@@ -121,19 +118,9 @@ void ledger::observe(const Obs& obs)
             if (e.predicted >= 0)
             {
                 // The window closed on schedule only when the group is seen
-                // alive no later than the last implied round — it cannot
-                // respawn early, and seeing it alive rules out a delay. A
-                // later sighting leaves the true round ambiguous
-                // (on-time-unseen vs delayed), logged under a separate tag.
-                if (round <= e.ready_at)
-                    std::cout << "LEDGER predicted=" << e.predicted
-                              << " actual=" << round
-                              << " group=" << static_cast<int>(seen.group) << '\n';
-                else
-                    std::cout << "LEDGER_GAP predicted=" << e.predicted
-                              << " alive=" << round
-                              << " implied=" << e.ready_at
-                              << " group=" << static_cast<int>(seen.group) << '\n';
+                // alive no later than the last implied round; a later
+                // sighting leaves the true round ambiguous. Either way the
+                // anchor has been spent — drop it.
                 e.predicted = -1;
             }
             e.ready_at = 0;

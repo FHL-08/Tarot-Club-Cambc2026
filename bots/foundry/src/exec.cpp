@@ -10,6 +10,7 @@
 #include <cambc.h>
 #include "exec.h"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -29,24 +30,6 @@ namespace {
 enum class State : std::uint8_t {
     boot, channel, tactic, pitstop, bank, travel, clear, capture, haul, idle
 };
-
-const char* state_name(State s)
-{
-    switch (s)
-    {
-    case State::boot: return "BOOT";
-    case State::channel: return "CHANNEL";
-    case State::tactic: return "TACTIC";
-    case State::pitstop: return "PITSTOP";
-    case State::bank: return "BANK";
-    case State::travel: return "TRAVEL";
-    case State::clear: return "CLEAR";
-    case State::capture: return "CAPTURE";
-    case State::haul: return "HAUL";
-    case State::idle: return "IDLE";
-    }
-    return "?";
-}
 
 // A route/haul move whose nav::step fails this many turns running means
 // the goal is pocketed behind walls/holes or a permanently sealed ring —
@@ -68,15 +51,22 @@ struct Mem {
     int allies = 0;
     int contested_group = -1;
     std::int32_t contested_since = -1;
-    int stand_group = -1;
-    std::int32_t stand_since = -1;
-    bool overrun_logged = false;
     int nav_pending = -1; // route/haul group the emitted Move steers to
-    int nav_fail_group = -1;
     int nav_fail_count = 0;
     std::vector<std::uint32_t> unreachable_until; // per-group blacklist expiry
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
+    std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
+    // Compiled-plan binding, filled once from the draft blob. `route` is a
+    // view into the Bot-held Plan — both stay valid for the whole match.
+    bool plan_bound = false;
+    bool have_route = false;
+    Role role = Role::FLEX;
+    std::uint32_t bag_cap = 0;             // the plan's divert threshold for this slot
+    Route route{};                         // this slot's cyclic stop list
+    std::array<std::uint8_t, 8> owned{};   // 64-group mask of the route's CAMP stops
+    std::uint8_t cursor = 0;               // cyclic scan position in route
+    int active_target = -1;                // in-flight route target — hysteresis anchor
 };
 Mem mem;
 
@@ -84,6 +74,7 @@ struct GroupGeo {
     cambc::bitboard tiles;
     std::vector<cambc::vec2> tile_list;
     bool monolith = false; // 20k hp at 200 dmg — a planner decision (#8), not a stub stop
+    std::uint32_t gems = 0;  // 0 = pure gold camp: fallback work only, never displaces a real capture
 };
 
 // Camp layouts are immutable — the host layout query runs once.
@@ -98,12 +89,14 @@ const std::vector<GroupGeo>& groups()
             geo.tile_list = geo.tiles.positions();
             for (const auto& member : group)
                 geo.monolith = geo.monolith || member.is_monolith();
+            geo.gems = group.gem_value();
             out.push_back(std::move(geo));
         }
         return out;
     }();
     return cache;
 }
+
 
 // Spawn tile → group index, -1 elsewhere; built once since layouts never change.
 const std::vector<std::int16_t>& group_at()
@@ -136,14 +129,33 @@ int my_slot()
     return mem.slot;
 }
 
-// Stub partition (the planner owns the real assignment, #8): camp indices
-// are dealt round-robin across champion body slots, g % stride == slot %
-// stride with stride = min(allies, groups). Every group has exactly one
-// owner while allies ≤ groups; extra bodies share the smallest indices.
+// Bind this champion's slot route once. A blob that doesn't cover the slot
+// (fewer slots than bodies) leaves have_route false → stub partition.
+void bind_plan(const Plan& plan)
+{
+    if (mem.plan_bound) return;
+    mem.plan_bound = true;
+    if (mem.slot < 0 || mem.slot >= plan.num_slots()) return;
+    mem.role = plan.role_at(static_cast<std::uint8_t>(mem.slot));
+    mem.bag_cap = plan.bag_cap(mem.role);
+    mem.route = plan.route_at(static_cast<std::uint8_t>(mem.slot));
+    for (std::uint8_t i = 0; i < mem.route.size(); ++i)
+        if (const Stop stop = mem.route[i]; stop.kind == StopKind::CAMP)
+            mem.owned[stop.index >> 3] |= static_cast<std::uint8_t>(1u << (stop.index & 7));
+    mem.have_route = !mem.route.is_empty();
+}
+
+// Ownership is a union: the compiled route marks its stops, and the modulo
+// partition under it still gives every group exactly one fallback owner —
+// unrouted camps (monolith-adjacent, above the solo floor) would otherwise
+// be owned by nobody and never ground down.
 bool mine(int g)
 {
     const int stride = std::max(1, std::min(mem.allies, static_cast<int>(groups().size())));
-    return g % stride == mem.slot % stride;
+    if (g >= 0 && g % stride == mem.slot % stride) return true;
+    if (mem.have_route)
+        return g < 64 && ((mem.owned[g >> 3] >> (g & 7)) & 1);
+    return false;
 }
 
 const CampObs* seen(const Obs& obs, int g)
@@ -158,6 +170,8 @@ bool unreachable(int g, std::uint32_t round)
     return g < static_cast<int>(mem.unreachable_until.size())
         && mem.unreachable_until[static_cast<std::size_t>(g)] > round;
 }
+
+
 
 // Identical legality mask to nav.cpp's blocked_tiles — goal seeds must be
 // masked with it because an occupied goal tile would still seed the descent.
@@ -231,9 +245,8 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
 {
     if (next != mem.state)
     {
-        std::cout << "FSM " << mem.slot << ' ' << state_name(mem.state) << "->" << state_name(next)
-                  << " r" << obs.round << '\n';
         mem.state = next;
+        mem.state_since = static_cast<std::int32_t>(obs.round);
     }
     return action;
 }
@@ -242,11 +255,10 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
 
 exec::Action exec::tick(const Obs& obs, const Plan& plan)
 {
-    (void)plan; // stub route comes from the ledger, not the compiled stops (#8)
     using cs = cambc::champion_state;
     const auto st = obs.self_state;
-
-    my_slot(); // before any done() — the transition log prints the real slot
+    my_slot();
+    bind_plan(plan);
     mem.nav_pending = -1;
 
     // Mid-channel turns can't act — tribute/recall/teleport continue alone.
@@ -269,7 +281,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     bool threat = false;
     for (const auto& e : obs.enemies)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
-    const bool dying = obs.self_health < obs.self_max_health * 0.45f;
+    const bool dying = obs.self_health < obs.self_max_health * 0.35f;
     const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
 
     // A recall we emitted that never shows in champion_state was cancelled
@@ -292,15 +304,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             const bool contested = enemy_on(here, obs);
             if (!contested)
             {
-                if (mem.stand_group != here) { mem.stand_group = here; mem.stand_since = obs.round; mem.overrun_logged = false; }
-                // L1: an uncontested capture resolves in capture_time+1; a
-                // longer stand means progress reset we couldn't see.
-                if (!mem.overrun_logged
-                    && static_cast<std::int32_t>(obs.round) - mem.stand_since > cambc::constants::capture_time + 1)
-                {
-                    mem.overrun_logged = true;
-                    std::cout << "FSM_L1 capture-overrun g" << here << " r" << obs.round << '\n';
-                }
                 // Low HP alone doesn't break the stand — the group's own
                 // camps are dead and strangers sleep two rounds after we
                 // stop poking — but an enemy champion in reach does.
@@ -327,7 +330,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             // Timed out or threatened — contested camp is excluded below ("else move on").
         }
     }
-    if (mem.stand_group != here) { mem.stand_group = -1; mem.stand_since = -1; }
     if (mem.contested_group != here) { mem.contested_group = -1; mem.contested_since = -1; }
 
     // Pitstop: badly hurt, or hurt with an enemy in reach. Damage
@@ -335,7 +337,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // can still reach us we walk home — out of range the channel is safe.
     // 'exposed' only sees visible attackers; a bush-hidden one still breaks
     // the channel every turn, so after max_recall_retries cancels we walk.
-    if (unsafe || (mem.state == State::pitstop && at_spawn && obs.self_health < obs.self_max_health * 0.9f))
+    // The retreat arm is sticky: a champion already fleeing stays on the
+    // retreat below 75% — re-checking `unsafe` each turn flickers between
+    // TRAVEL and PITSTOP when a threat pops in and out of vision.
+    const bool retreating = mem.state == State::pitstop
+        && obs.self_health < obs.self_max_health * 0.75f;
+    if (unsafe || retreating
+        || (mem.state == State::pitstop && at_spawn && obs.self_health < obs.self_max_health * 0.9f))
     {
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
         bool exposed = threat;
@@ -353,15 +361,38 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
     const auto blocked = blocked_tiles();
 
-    // Bank once the bag crosses the econ cap or the deadline forces it.
-    if (econ::should_tribute(obs))
+    // Bank trigger: with a compiled route the plan's role bag_cap adds an
+    // early divert threshold on top of econ's; when it fires, the route's
+    // next spliced ALTAR stop is the preferred tribute point.
+    int preferred = -1; // route's next ALTAR stop, when the cap triggered it
+    const bool over_cap = mem.have_route && mem.bag_cap && obs.self_gems >= mem.bag_cap;
+    if (over_cap)
+    {
+        const auto altars = cambc::map::altars().positions();
+        for (std::uint8_t i = 0; i < mem.route.size() && preferred < 0; ++i)
+            if (const Stop stop = mem.route.at(mem.cursor + i);
+                stop.kind == StopKind::ALTAR && stop.index < altars.size())
+                preferred = stop.index;
+    }
+    // econ::should_tribute covers the piñata ceiling, the deadline walk and
+    // the scoreboard-aware dynamic cap; the plan's per-role bag_cap only
+    // tightens it (a role carrying past its splice point banks early).
+    const bool bank_now = over_cap || econ::should_tribute(obs);
+    if (bank_now)
     {
         cambc::vec2 nearest{}, locked{};
         std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
         std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
         cambc::bitboard rings;
-        for (const auto altar : cambc::map::altars().positions())
+        const auto altars = cambc::map::altars().positions();
+        // A locked route altar falls back to the nearest unlocked one.
+        if (preferred >= 0 && cambc::vision::has_altar_lock(altars[preferred])) preferred = -1;
+        for (std::size_t a = 0; a < altars.size(); ++a)
         {
+            const auto altar = altars[a];
+            // The route's spliced ALTAR stop is the planned tribute point:
+            // while it stands unlocked, other altars don't compete.
+            if (preferred >= 0 && static_cast<std::int32_t>(a) != preferred) continue;
             // An enemy lock turns the tribute attempt into a lock attack
             // (GameRules §Tributing against a lock) — taking the nearest
             // locked altar still clears it, while our own locks never block
@@ -389,40 +420,104 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             return done(State::bank, Move{ std::move(rings) }, obs);
     }
 
-    // Route step: greedy nearest-ready over the partition; a confirmed
-    // reward outranks a believed-live camp at any distance.
+    // Route step. With a compiled route: cyclic scan from the cursor — the
+    // first actionable CAMP stop wins, ALTAR/PITSTOP stops are splice markers
+    // the bank and pitstop guards consume. Without one: the stub's greedy
+    // nearest-ready over the round-robin partition, a confirmed reward
+    // outranking a believed-live camp at any distance.
     int target = -1;
     bool target_reward = false;
     std::int64_t target_cost = 0;
-    for (std::size_t g = 0; g < geos.size(); ++g)
-    {
-        if (!mine(static_cast<int>(g)) || geos[g].monolith
-            || unreachable(static_cast<int>(g), obs.round))
-            continue;
-        const CampObs* c = seen(obs, static_cast<int>(g));
+    // Gold-only camps are filler: the race is 1000 tributed gems, so the
+    // best gem-bearing target always wins and a 0-gem camp is picked only
+    // when no gem target is actionable at all.
+    int gold_target = -1;
+    bool gold_reward = false;
+    std::int64_t gold_cost = 0;
+    // In-flight target hysteresis: re-deriving greedy-nearest every turn
+    // dithers on the boundary between two equidistant camps (step toward A
+    // makes B nearer, step toward B makes A nearer — one champion froze an
+    // entire match). While the active target stays actionable, a rival must
+    // win by a real margin or outrank it on reward-vs-alive to take over.
+    int active_state = 0; // 0 not actionable, 1 alive-belief, 2 reward
+    std::int64_t active_cost = 0;
+    // Unified candidate pass: the route's camp stops plus every group the
+    // partition owns, deduped and evaluated once each. A gem pack two tiles
+    // away must outrank a route-listed gold cluster forty tiles away — the
+    // two-tier scan (route only, then grind on exhaustion) made Vendetta
+    // march past an owned pack to the map's far edge on rows.
+    std::uint64_t scanned = 0; // group ids share mem.owned's <64 space
+    const auto consider = [&](int g, std::int8_t cursor_idx) {
+        if (g < 0 || g >= static_cast<int>(geos.size()) || ((scanned >> g) & 1)) return;
+        scanned |= 1ull << g;
+        if (geos[g].monolith || unreachable(g, obs.round)) return;
         bool reward = false;
-        std::int64_t cost;
-        if (c)
+        if (const CampObs* c = seen(obs, g))
         {
-            if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state)) continue;
+            if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state)) return;
             if (std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
             {
-                if (enemy_on(static_cast<int>(g), obs)) continue; // contested, we hold nothing: move on
-                auto free_tiles = geos[g].tiles & ~blocked;
-                if (free_tiles.is_empty()) continue;              // ally already covers it
+                if (enemy_on(g, obs)) return; // contested, we hold nothing: move on
+                if ((geos[g].tiles & ~blocked).is_empty()) return; // ally already covers it
                 reward = true;
             }
-            cost = dist_to(geos[g], pos);
         }
-        else
+        else if (ledger::ready_round(g) > static_cast<std::int32_t>(obs.round))
+            return;
+        const auto cost = dist_to(geos[g], pos);
+        if (g == mem.active_target) { active_state = reward ? 2 : 1; active_cost = cost; }
+        int& bt = geos[g].gems ? target : gold_target;
+        bool& br = geos[g].gems ? target_reward : gold_reward;
+        std::int64_t& bc = geos[g].gems ? target_cost : gold_cost;
+        if (bt < 0 || (reward && !br) || (reward == br && cost < bc))
         {
-            if (ledger::ready_round(static_cast<int>(g)) > static_cast<int>(obs.round)) continue;
-            cost = dist_to(geos[g], pos);
+            bt = g;
+            br = reward;
+            bc = cost;
+            if (&bt == &target && cursor_idx >= 0) mem.cursor = static_cast<std::uint8_t>(cursor_idx);
         }
-        const bool better = target < 0 || (reward && !target_reward)
-            || (reward == target_reward && cost < target_cost);
-        if (better) { target = static_cast<int>(g); target_reward = reward; target_cost = cost; }
+    };
+
+    if (mem.have_route)
+    {
+        // Cyclic scan from the cursor — strict cycle order would force
+        // cross-map legs between respawns; the winning pattern is
+        // re-harvesting the same few camps each period.
+        const auto n = mem.route.size();
+        for (std::uint8_t i = 0; i < n; ++i)
+        {
+            const auto idx = static_cast<std::uint8_t>((mem.cursor + i) % n);
+            if (const Stop stop = mem.route[idx]; stop.kind == StopKind::CAMP)
+                consider(stop.index, static_cast<std::int8_t>(idx));
+        }
     }
+    // The modulo partition under the route: unrouted leftovers (packs above
+    // the solo floor, monolith-adjacent) still have an owner to grind them;
+    // without a route this IS the whole job.
+    for (std::size_t g = 0; g < geos.size(); ++g)
+        if (mine(static_cast<int>(g))) consider(static_cast<int>(g), -1);
+
+    if (target < 0) { target = gold_target; target_reward = gold_reward; }
+    // An in-flight gold errand is preemptible the moment real work exists.
+    if (active_state && mem.active_target >= 0 && geos[mem.active_target].gems == 0 && target >= 0)
+        active_state = 0;
+
+    if (active_state)
+    {
+        // Commit until done unless a gem rival clearly outranks: a pending
+        // capture beats a live-camp errand, and a respawned camp eight
+        // tiles closer beats the walk. 1-3 tile margins still dither on
+        // Voronoi boundaries — the threshold must exceed the flip band.
+        const bool rival = target >= 0 && geos[target].gems > 0
+            && ((target_reward && active_state == 1)
+                || (target_reward == (active_state == 2) && target_cost + 8 < active_cost));
+        if (target < 0 || !rival)
+        {
+            target = mem.active_target;
+            target_reward = active_state == 2;
+        }
+    }
+    mem.active_target = target;
 
     if (target >= 0)
     {
@@ -504,12 +599,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             || unreachable(static_cast<int>(g), obs.round))
             continue;
         const CampObs* c = seen(obs, static_cast<int>(g));
-        if (c && std::holds_alternative<cambc::map::camp_group_alive>(c->state)
-            && !enemy_on(static_cast<int>(g), obs))
-        {
-            std::cout << "FSM_L1 idle-work g" << g << " r" << obs.round << '\n';
-            break;
-        }
     }
     return done(State::idle, Wait{}, obs);
 }
@@ -530,28 +619,55 @@ bool exec::apply(const Action& action)
                 // route falls through to the next-best stop.
                 if (mem.nav_pending >= 0)
                 {
+                    // Consecutive failures accumulate across targets, not just
+                    // per group — a route ping-ponging between two unreachable
+                    // camps would otherwise reset the count every turn and
+                    // orbit forever.
                     if (moved)
-                    {
-                        mem.nav_fail_group = -1;
                         mem.nav_fail_count = 0;
-                    }
-                    else if (mem.nav_fail_group == mem.nav_pending)
-                    {
-                        ++mem.nav_fail_count;
-                    }
                     else
-                    {
-                        mem.nav_fail_group = mem.nav_pending;
-                        mem.nav_fail_count = 1;
-                    }
+                        ++mem.nav_fail_count;
                     if (mem.nav_fail_count >= nav_fail_limit)
                     {
                         if (mem.unreachable_until.size() != groups().size())
                             mem.unreachable_until.assign(groups().size(), 0);
                         mem.unreachable_until[static_cast<std::size_t>(mem.nav_pending)]
                             = cambc::round_number() + nav_cooldown;
-                        mem.nav_fail_group = -1;
                         mem.nav_fail_count = 0;
+                    }
+                }
+                // The move only spent the move allowance — a melee body
+                // still holds a basic attack (ranged lose it to the shared
+                // allowance, which can_attack reports). Spend it like the
+                // tactic offer would: a champion in range outranks a
+                // monster, and only the nav target's group is safe to wake.
+                if (moved && me.can_attack())
+                {
+                    const auto attack_tiles = me.attack_tiles();
+                    float best_health = 0;
+                    bool found = false;
+                    cambc::vec2 hit{};
+                    for (const auto& e : cambc::vision::champions(cambc::team::enemy))
+                    {
+                        if (!e.is_visible() || e.health() <= 0
+                            || !attack_tiles.is_set(e.position())) continue;
+                        if (!found || e.health() < best_health)
+                        { hit = e.position(); best_health = e.health(); found = true; }
+                    }
+                    if (found)
+                    {
+                        try { me.attack(cambc::vision::champion_at(hit)); return true; }
+                        catch (const cambc::error&) { /* tile emptied mid-turn */ }
+                    }
+                    if (mem.nav_pending >= 0)
+                    {
+                        for (const auto& c : cambc::vision::camps())
+                        {
+                            if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
+                            if (group_of(c.spawn_position()) != mem.nav_pending) continue;
+                            try { me.attack(c); return true; }
+                            catch (const cambc::error&) { return moved; }
+                        }
                     }
                 }
                 return moved;
@@ -630,8 +746,8 @@ bool exec::apply(const Action& action)
             else if constexpr (std::is_same_v<T, Buy>)
             {
                 if (a.count == 0 || !me.can_buy(a.item, a.count)) return false;
-                me.buy(a.item, a.count);
-                return true;
+                try { me.buy(a.item, a.count); return true; }
+                catch (const cambc::error&) { return false; }
             }
             else
             {

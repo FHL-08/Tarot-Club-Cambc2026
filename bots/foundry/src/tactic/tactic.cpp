@@ -11,5 +11,8 @@ std::optional<exec::Action> tactic::offer(const Obs& obs)
     if (const auto action = gank(obs)) return action;
     if (const auto action = lock(obs)) return action;
     if (const auto action = deny(obs)) return action;
+    // Nothing interdicted: the basic attack a turn already allows still
+    // fires — an enemy champion in range is hit, never ignored.
+    if (const auto action = poke(obs)) return action;
     return std::nullopt;
 }
