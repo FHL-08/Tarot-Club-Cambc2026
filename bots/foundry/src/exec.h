@@ -47,9 +47,17 @@ struct Buy {
     std::uint32_t count = 0;
 };
 
+// Consumable use: altar locks place on an altar tile (range 2), teleport
+// crystals start a channel toward a landing tile. The engine validates
+// inventory and range at apply time.
+struct UseItem {
+    cambc::consumable_type item{};
+    cambc::vec2 target{};
+};
+
 struct Wait {};
 
-using Action = std::variant<Move, Attack, Cast, Channel, Buy, Wait>;
+using Action = std::variant<Move, Attack, Cast, Channel, Buy, UseItem, Wait>;
 
 // Guard order: channel-continuation → tactic::offer → capture-stay →
 // pitstop → bank → route (contested/respawning filtered) → haul → idle.
