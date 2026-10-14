@@ -62,7 +62,11 @@ matches() { # <file> <patterns, comma-separated>
   return 1
 }
 
-changed="$(gh pr diff "$pr" --name-only)"
+# gh diff API 406s past 20k lines.
+changed="$(gh pr diff "$pr" --name-only)" || {
+  git fetch -q origin "refs/pull/$pr/head"
+  changed="$(git diff --name-only origin/main...FETCH_HEAD)"
+}
 [ -n "$changed" ] || veto "PR #$pr has no diff"
 outside=""
 while IFS= read -r f; do
