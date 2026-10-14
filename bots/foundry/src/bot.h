@@ -5,15 +5,19 @@
 
 // Per-champion state survives between turns.
 class Bot {
-    int chosen_stat = -1;
     std::optional<Role> role_;
+    std::optional<Plan> plan_;
 
     // This champion's plan role: its index in the ally handle order
     // (plan.h slot space), FLEX when the slot table doesn't cover it.
     Role role();
 
+    // The decoded draft blob; an empty Plan when the bytes don't decode so
+    // exec still gets a valid reference.
+    const Plan& plan();
+
 public:
-    // Priorities: shop (spawn or dead), recall, attack enemies in range,
-    // bank gems at the econ bag-cap, then farm.
+    // Passive phases (econ buys, ledger observe) run even on dead or
+    // channelling turns, then exec's FSM picks the turn's action.
     void play_turn();
 };
