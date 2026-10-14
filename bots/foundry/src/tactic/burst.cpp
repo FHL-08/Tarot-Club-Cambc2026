@@ -39,7 +39,16 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
     if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
     // Below the pitstop line the retreat owns the turn — poke carries the
     // same guard; casting instead of recalling is how bodies get chained.
-    if (obs.self_health < obs.self_max_health * 0.6f) return std::nullopt;
+    // Under a reachable enemy the floor drops to 0.3: spending a cast beats
+    // dying with it held.
+    float gate = 0.6f;
+    for (const auto& e : obs.enemies)
+    {
+        if (e.health <= 0) continue;
+        const auto r = turn::enemy_attack_range(e.position);
+        if (r && obs.self_pos.chebyshev_distance(e.position) <= *r + 1) { gate = 0.3f; break; }
+    }
+    if (obs.self_health < obs.self_max_health * gate) return std::nullopt;
     const auto& abilities = turn::abilities();
 
     // The stun flag only feeds cc re-stun scoring — a buffs() call per
