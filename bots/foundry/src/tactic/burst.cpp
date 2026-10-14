@@ -17,6 +17,7 @@ struct Target {
     std::uint32_t gems = 0;
     bool channelling = false; // tribute or recall — pinned in place
     bool stunned = false;
+    float attack_range = 0; // read once — it can't change mid-turn
 };
 
 [[nodiscard]] float range_of(const cambc::ability& ab)
@@ -52,72 +53,111 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
             auto handle = cambc::vision::champion_at(e.position);
             targets.push_back({ handle, e.position, e.health, e.gems,
                 e.submitting || handle.is_recalling(),
-                handle.buffs().has_stun() });
+                handle.buffs().has_stun(), static_cast<float>(handle.attack_range()) });
         }
         catch (const cambc::error&) { continue; } // left vision between collect and now
     }
 
-    // 1. Damage / AoE / cc on an enemy champion. Pick the (slot, target)
-    // pair by damage_amount; cc scoring zero still fires when nothing
-    // hurts. Priority: interrupt a channel, then lowest health, then bag.
+    // 1. Damage / AoE / cc on enemy champions. Every ready slot — whether
+    // it targets enemy entities or only ground tiles (Stellar/Ryth/Prism
+    // area spells: enemy-only checks used to skip them entirely) — scores
+    // candidate casts the same way: enemies hit, then summed
+    // damage_amount, then channel/health/bag priority. An area stun that
+    // would only re-stun already-stunned enemies ranks last.
     int best_slot = -1;
     cambc::vec2 best_tile{};
     bool best_ground = false;
+    int best_hits = 0;
     float best_dmg = -1;
+    bool best_restun = false;
     const Target* best_t = nullptr;
-    auto better_target = [](const Target& a, const Target* b, bool cc) {
+    auto better_target = [](const Target& a, const Target* b) {
         if (!b) return true;
         if (a.channelling != b->channelling) return a.channelling;
-        // Stuns are wasted on an already-stunned enemy when another legal
-        // target exists.
-        if (cc && a.stunned != b->stunned) return !a.stunned;
         if (a.health != b->health) return a.health < b->health;
         return a.gems > b->gems;
+    };
+    auto consider = [&](std::uint32_t slot, cambc::vec2 tile, bool ground,
+                        int hits, float dmg, const Target& anchor, bool restun) {
+        bool better;
+        if (best_slot < 0) better = true;
+        else if (restun != best_restun) better = !restun;
+        else if (hits != best_hits) better = hits > best_hits;
+        else if (dmg != best_dmg) better = dmg > best_dmg;
+        else better = better_target(anchor, best_t);
+        if (better)
+        {
+            best_slot = static_cast<int>(slot);
+            best_tile = tile;
+            best_ground = ground;
+            best_hits = hits;
+            best_dmg = dmg;
+            best_restun = restun;
+            best_t = &anchor;
+        }
+    };
+    // damage_amount is a host call per (slot, enemy) — cache it for the
+    // turn; the 9-centre scan would otherwise re-price the same pair.
+    std::array<std::vector<float>, 2> dmg_cache{
+        std::vector<float>(targets.size(), -1.f),
+        std::vector<float>(targets.size(), -1.f) };
+    std::array<std::vector<char>, 2> dmg_bad{
+        std::vector<char>(targets.size(), 0),
+        std::vector<char>(targets.size(), 0) };
+    auto dmg_of = [&](std::uint32_t slot, std::size_t i) {
+        float& cached = dmg_cache[slot][i];
+        if (cached < 0 && !dmg_bad[slot][i])
+            try { cached = abilities[slot].damage_amount(targets[i].handle); }
+            catch (const cambc::error&) { dmg_bad[slot][i] = 1; }
+        return cached;
     };
     for (std::uint32_t slot = 0; slot < 2; ++slot)
     {
         const auto& ab = abilities[slot];
-        if (!ab.info() || !ab.is_ready() || !ab.can_target_enemies()) continue;
+        if (!ab.info() || !ab.is_ready()) continue;
         const bool cc = ab.is_cc(), aoe = ab.is_aoe_damage();
         if (!ab.is_damage() && !cc && !aoe) continue;
         cambc::bitboard reach{ cambc::uninitialized };
         ab.mask_into(reach);
-        for (const auto& t : targets)
+        if (ab.can_target_enemies())
+            for (std::size_t i = 0; i < targets.size(); ++i)
+            {
+                const auto& t = targets[i];
+                if (!reach.is_set(t.pos)) continue;
+                const float dmg = dmg_of(slot, i);
+                if (dmg_bad[slot][i]) continue;
+                consider(slot, t.pos, false, 1, dmg, t, cc && t.stunned);
+            }
+        if (ab.can_target_ground() && (aoe || cc))
         {
-            if (!reach.is_set(t.pos)) continue;
-            cambc::vec2 tile = t.pos;
-            int hits = 1;
-            if (aoe)
-            {
-                // Centre the blast on the enemy covering the most enemies.
-                const float radius = ab.get<cambc::ability_aoe_damage>().radius;
-                for (const auto& centre : targets)
-                {
-                    if (!reach.is_set(centre.pos)) continue;
-                    int n = 0;
-                    for (const auto& other : targets)
-                        if (centre.pos.chebyshev_distance(other.pos)
-                            <= static_cast<std::int64_t>(radius))
-                            ++n;
-                    if (n > hits) { hits = n; tile = centre.pos; }
-                }
-            }
-            if (!better_target(t, best_t, cc)) continue;
-            float dmg = 0;
-            try { dmg = ab.damage_amount(t.handle); }
-            catch (const cambc::error&) { continue; }
-            const bool ground = aoe && !ab.can_target_enemies();
-            // One action spends one slot: the biggest hit wins; a cc that
-            // would only re-stun loses to any alternative via better_target.
-            if (best_slot < 0 || dmg > best_dmg
-                || (dmg == best_dmg && better_target(t, best_t, cc)))
-            {
-                best_slot = static_cast<int>(slot);
-                best_tile = tile;
-                best_ground = ground;
-                best_dmg = dmg;
-                best_t = &t;
-            }
+            // The cc payload carries no radius — every ground cc kit ships
+            // "radius one" (Ryth's area stun), so 1 is the kit constant.
+            const float radius = aoe ? ab.get<cambc::ability_aoe_damage>().radius : 1.0f;
+            for (const auto& t : targets)
+                for (int dx = -1; dx <= 1; ++dx)
+                    for (int dy = -1; dy <= 1; ++dy)
+                    {
+                        const cambc::vec2 centre{ t.pos.x + dx, t.pos.y + dy };
+                        if (!reach.is_set(centre)) continue;
+                        int hits = 0;
+                        float dmg = 0;
+                        bool all_stunned = true;
+                        const Target* anchor = nullptr;
+                        for (std::size_t i = 0; i < targets.size(); ++i)
+                        {
+                            const auto& e = targets[i];
+                            if (centre.chebyshev_distance(e.pos)
+                                > static_cast<std::int64_t>(radius))
+                                continue;
+                            ++hits;
+                            all_stunned = all_stunned && e.stunned;
+                            dmg += dmg_of(slot, i);
+                            if (better_target(e, anchor)) anchor = &e;
+                        }
+                        if (hits > 0)
+                            consider(slot, centre, true, hits, dmg, *anchor,
+                                cc && all_stunned);
+                    }
         }
     }
     if (best_slot >= 0)
@@ -131,8 +171,7 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
         for (const auto& t : targets)
             try
             {
-                if (pos.chebyshev_distance(t.pos)
-                    <= t.handle.attack_range() + 1)
+                if (pos.chebyshev_distance(t.pos) <= t.attack_range + 1)
                     return true;
             }
             catch (const cambc::error&) { continue; }
