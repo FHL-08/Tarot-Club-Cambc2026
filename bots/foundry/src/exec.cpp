@@ -1,6 +1,7 @@
 // exec — the runtime FSM replacing the starter decision list
 // (docs/strategy.md §RUNTIME). Guard order inside tick:
-//   channel-continuation → tactic::offer → capture-stay → pitstop →
+//   channel-continuation → tactic::offer → fight-or-flight →
+//   capture-stay → pitstop →
 //   bank → route step (contested/respawning filtered) → haul → idle.
 // The stub planner is rebuilt from ledger::ready_round every turn — greedy
 // nearest-ready over a deterministic slot partition — so FSM state is
@@ -24,6 +25,7 @@
 #include "obs.h"
 #include "plan.h"
 #include "tactic/tactic.h"
+#include "tactic/support.h"
 
 namespace {
 
@@ -265,6 +267,86 @@ std::int64_t dist_to(const GroupGeo& g, cambc::vec2 p)
     std::int64_t best = std::numeric_limits<std::int64_t>::max();
     for (const auto tile : g.tile_list) best = std::min(best, p.chebyshev_distance(tile));
     return best;
+}
+
+// Nearest altar open to us — our own locks never block a tribute, an
+// enemy-locked altar isn't one (it becomes a lock attack instead).
+std::optional<cambc::vec2> nearest_open_altar(cambc::vec2 pos)
+{
+    std::optional<cambc::vec2> best;
+    std::int64_t best_d = std::numeric_limits<std::int64_t>::max();
+    for (const auto altar : cambc::map::altars().positions())
+    {
+        const bool enemy_locked = cambc::vision::has_altar_lock(altar)
+            && cambc::vision::altar_lock_at(altar).is_enemy();
+        if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < best_d)
+        {
+            best_d = d;
+            best = altar;
+        }
+    }
+    return best;
+}
+
+cambc::vec2 spawn_centre()
+{
+    static const cambc::vec2 centre = [] {
+        const auto tiles = cambc::map::spawn_region(cambc::team::ally).positions();
+        std::int64_t sx = 0, sy = 0;
+        for (const auto t : tiles) { sx += t.x; sy += t.y; }
+        return tiles.empty() ? cambc::vec2{}
+            : cambc::vec2{ static_cast<std::int32_t>(sx / tiles.size()),
+                           static_cast<std::int32_t>(sy / tiles.size()) };
+    }();
+    return centre;
+}
+
+// The bank block's altar pick: tribute at the nearest open altar inside
+// submit range, a lock attack on the nearest enemy-locked one, else move
+// onto the approach rings. `preferred` pins the route's spliced ALTAR
+// stop while it stands unlocked.
+std::optional<exec::Action> bank_toward(const Obs& obs, int preferred,
+    const cambc::bitboard& blocked)
+{
+    const cambc::vec2 pos = obs.self_pos;
+    cambc::vec2 nearest{}, locked{};
+    std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
+    std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
+    cambc::bitboard rings;
+    const auto altars = cambc::map::altars().positions();
+    // A locked route altar falls back to the nearest unlocked one.
+    if (preferred >= 0 && cambc::vision::has_altar_lock(altars[preferred])) preferred = -1;
+    for (std::size_t a = 0; a < altars.size(); ++a)
+    {
+        const auto altar = altars[a];
+        // The route's spliced ALTAR stop is the planned tribute point:
+        // while it stands unlocked, other altars don't compete.
+        if (preferred >= 0 && static_cast<std::int32_t>(a) != preferred) continue;
+        // An enemy lock turns the tribute attempt into a lock attack
+        // (GameRules §Tributing against a lock) — taking the nearest
+        // locked altar still clears it, while our own locks never block
+        // us and unlocked altars always win the pick.
+        const bool enemy_locked = cambc::vision::has_altar_lock(altar)
+            && cambc::vision::altar_lock_at(altar).is_enemy();
+        rings.draw_chebyshev(altar, cambc::constants::submit_gems_range);
+        if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < nearest_d)
+        {
+            nearest_d = d;
+            nearest = altar;
+        }
+        else if (enemy_locked && d < locked_d)
+        {
+            locked_d = d;
+            locked = altar;
+        }
+    }
+    if (nearest_d <= cambc::constants::submit_gems_range)
+        return exec::Channel{ exec::Channel::Kind::tribute, nearest };
+    if (locked_d <= cambc::constants::submit_gems_range)
+        return exec::Channel{ exec::Channel::Kind::tribute, locked };
+    rings &= ~blocked;
+    if (!rings.is_empty()) return exec::Move{ std::move(rings) };
+    return std::nullopt; // every approach tile occupied: bank later
 }
 
 // Grouped-opening stop order (issue #38): every body must derive the SAME
@@ -607,15 +689,24 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
     }
 
-    // Lethal-threat proxy: a visible enemy champion inside maximum attack
-    // reach (3). Enemy camps aren't observable here, so plain low-HP stays
-    // the floor and the threat case lifts it — recall channels for 5 turns
-    // under fire, so the earlier exit is what survives the channel.
-    bool threat = false;
+    // Kill-race threat model (issue #39): the win condition is banked
+    // gems, not survival — a body that dies right after banking lost
+    // nothing, while a dead carrier hands the killer the bag plus 50g
+    // (GameRules §Death). TTD = own turns until the visible enemy dps
+    // kills us; TTK(e) = own turns until our side kills e. The reads stay
+    // O(enemies × (slots + allies)) — extra host calls here would risk a
+    // fuel suspension, which defers the committed action a full round.
+    float incoming = 0;
+    bool enemy_near6 = false;
     for (const auto& e : obs.enemies)
-        if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
-    const bool dying = obs.self_health < obs.self_max_health * retreat_floor;
-    const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
+    {
+        if (e.health <= 0) continue;
+        incoming += tactic::enemy_dps_on(e, pos);
+        if (pos.chebyshev_distance(e.position) <= 6) enemy_near6 = true;
+    }
+    const float ttd = incoming > 0 ? obs.self_health / incoming
+        : std::numeric_limits<float>::infinity();
+    const bool threat = ttd < std::numeric_limits<float>::infinity();
 
     // A recall we emitted that never shows in champion_state was cancelled
     // by damage/stun between turns; a completed one lands on spawn.
@@ -625,11 +716,104 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (at_spawn) mem.recall_attempts = 0;
         else ++mem.recall_attempts;
     }
-    if (!unsafe) mem.recall_attempts = 0; // threat gone — retry freely next time
+    if (!enemy_near6) mem.recall_attempts = 0; // threat gone — retry freely next time
+
+    const auto blocked = blocked_tiles();
+
+    // Fight-or-flight, replacing the fixed-hp dying/unsafe guard: bank the
+    // bag when we outlive the trip, fight the fastest kill we win, else
+    // walk away. Recall is never the answer under reach — damage cancels
+    // the channel and the killer still takes the bag.
+    if (threat)
+    {
+        // Bank before death: tribute ticks are NOT cancelled by damage
+        // (only stun, death or an altar lock — GameRules §Channels), so
+        // banking under fire is safe whenever we outlive the walk to
+        // submit range plus the channel.
+        if (obs.self_gems >= 10)
+        {
+            if (const auto altar = nearest_open_altar(pos))
+            {
+                const float rounds_to_bank =
+                    std::max<std::int64_t>(0, pos.chebyshev_distance(*altar)
+                        - cambc::constants::submit_gems_range)
+                    + std::ceil(obs.self_gems / 10.f);
+                if (ttd > rounds_to_bank)
+                    if (const auto act = bank_toward(obs, -1, blocked))
+                        return done(State::bank, *act, obs);
+            }
+        }
+        // The fastest kill wins the pick — every body applies the same
+        // rule, so they converge on one target. Ties prefer the bigger
+        // bag (steal value), then the softer one.
+        const EnemyObs* pick = nullptr;
+        float pick_ttk = std::numeric_limits<float>::infinity();
+        for (const auto& e : obs.enemies)
+        {
+            if (e.health <= 0) continue;
+            const float t = tactic::time_to_kill(e);
+            if (!pick || t < pick_ttk
+                || (t == pick_ttk && (e.gems > pick->gems
+                    || (e.gems == pick->gems && e.health < pick->health))))
+            {
+                pick = &e;
+                pick_ttk = t;
+            }
+        }
+        // Engage only when the kill clearly lands first (10% margin) —
+        // a coin-flip race still risks the carried bag.
+        if (pick && pick_ttk <= ttd * 0.9f)
+        {
+            const auto& me = cambc::self();
+            const auto attack_tiles = me.attack_tiles();
+            if (attack_tiles.is_set(pick->position))
+                return done(State::clear, Attack{ pick->position, Attack::Kind::champion }, obs);
+            cambc::bitboard ring;
+            ring.draw_chebyshev(pick->position, me.attack_range());
+            ring &= ~blocked;
+            if (!ring.is_empty())
+                return done(State::travel, Move{ std::move(ring) }, obs);
+        }
+        // Losing the race: step onto the free neighbour that maximises the
+        // minimum enemy distance, breaking ties toward the nearest open
+        // altar with a bag (bank en route) or spawn otherwise.
+        if (pick && ttd < pick_ttk)
+        {
+            const cambc::vec2 ref = obs.self_gems > 0
+                ? nearest_open_altar(pos).value_or(spawn_centre()) : spawn_centre();
+            cambc::vec2 best_tile{};
+            std::int64_t best_dist = -1;
+            std::int64_t best_ref = std::numeric_limits<std::int64_t>::max();
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    if (!dx && !dy) continue;
+                    const cambc::vec2 t{ pos.x + dx, pos.y + dy };
+                    if (!cambc::map::is_in_bounds(t) || blocked.is_set(t)) continue;
+                    std::int64_t dist = std::numeric_limits<std::int64_t>::max();
+                    for (const auto& e : obs.enemies)
+                        if (e.health > 0 && tactic::enemy_dps_on(e, pos) > 0)
+                            dist = std::min(dist, t.chebyshev_distance(e.position));
+                    const std::int64_t ref_d = t.chebyshev_distance(ref);
+                    if (dist > best_dist || (dist == best_dist && ref_d < best_ref))
+                    {
+                        best_dist = dist;
+                        best_ref = ref_d;
+                        best_tile = t;
+                    }
+                }
+            if (best_dist >= 0)
+            {
+                cambc::bitboard goal;
+                goal.set(best_tile);
+                return done(State::travel, Move{ std::move(goal) }, obs);
+            }
+        }
+    }
 
     // Standing on own group's reward tiles: an uncontested stay completes
     // the capture (passive — free hit meanwhile), a contested one holds
-    // only inside the capture-time grace window while it's safe to.
+    // only inside the capture-time grace window while no enemy can reach.
     if (here >= 0 && mine(here))
     {
         if (const CampObs* c = seen(obs, here); c && std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
@@ -639,39 +823,36 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             {
                 // Low HP alone doesn't break the stand — the group's own
                 // camps are dead and strangers sleep two rounds after we
-                // stop poking — but an enemy champion in reach does.
-                if (!(threat && obs.self_health < obs.self_max_health * 0.6f))
-                {
-                    const auto attack_tiles = cambc::self().attack_tiles();
-                    if (const auto hit = attack_in_range(attack_tiles, -1, true))
-                        return done(State::capture, *hit, obs);
-                    return done(State::capture, Wait{}, obs);
-                }
+                // stop poking; an enemy in reach was already adjudicated
+                // by the fight-or-flight arm above.
+                const auto attack_tiles = cambc::self().attack_tiles();
+                if (const auto hit = attack_in_range(attack_tiles, -1, true))
+                    return done(State::capture, *hit, obs);
+                return done(State::capture, Wait{}, obs);
             }
-            else
+            if (mem.contested_group != here) { mem.contested_group = here; mem.contested_since = obs.round; }
+            const bool grace = static_cast<std::int32_t>(obs.round) - mem.contested_since <= cambc::constants::capture_time + 1;
+            if (grace && !threat)
             {
-                if (mem.contested_group != here) { mem.contested_group = here; mem.contested_since = obs.round; }
-                const bool grace = static_cast<std::int32_t>(obs.round) - mem.contested_since <= cambc::constants::capture_time + 1;
-                if (grace && !unsafe)
-                {
-                    const auto attack_tiles = cambc::self().attack_tiles();
-                    if (const auto hit = attack_in_range(attack_tiles, -1, true))
-                        return done(State::capture, *hit, obs);
-                    return done(State::capture, Wait{}, obs);
-                }
+                const auto attack_tiles = cambc::self().attack_tiles();
+                if (const auto hit = attack_in_range(attack_tiles, -1, true))
+                    return done(State::capture, *hit, obs);
+                return done(State::capture, Wait{}, obs);
             }
             // Timed out or threatened — contested camp is excluded below ("else move on").
         }
     }
     if (mem.contested_group != here) { mem.contested_group = -1; mem.contested_since = -1; }
 
-    // Pitstop: badly hurt, or hurt with an enemy in reach. Damage
-    // interrupts recall (GameRules §Channels), so while a live attacker
-    // can still reach us we walk home — out of range the channel is safe.
+    // Pitstop is heal-only now (issue #39): no enemy within 6 — the
+    // fight-or-flight arm owns those turns — bag small enough that banking
+    // isn't the better errand, and hurt past half. Damage interrupts
+    // recall (GameRules §Channels), so while a live attacker can still
+    // reach us we walk home — out of range the channel is safe.
     // 'exposed' only sees visible attackers; a bush-hidden one still breaks
     // the channel every turn, so after max_recall_retries cancels we walk.
     // The retreat arm is sticky: a champion already fleeing stays on the
-    // retreat below 75% — re-checking `unsafe` each turn flickers between
+    // retreat below 75% — re-checking each turn flickers between
     // TRAVEL and PITSTOP when a threat pops in and out of vision.
     // Heal-to-need: a return sortie's spendable budget is capped by the
     // retreat floor, so healing past (expected retaliation + floor) buys
@@ -690,12 +871,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 + dps_left * std::max(1.0f, hp_left / my_dps()) * 1.25f);
     }
     // Pitstop release: mid-retreat stays sticky below 75% (re-checking
-    // `unsafe` flickers when a threat pops in and out of vision); at spawn,
-    // the heal target above.
+    // each turn flickers when a threat pops in and out of vision); at
+    // spawn, the heal target above.
     const bool recovered = mem.state != State::pitstop
         || (at_spawn ? obs.self_health >= heal_target
                      : obs.self_health >= obs.self_max_health * 0.75f);
-    if (unsafe || !recovered)
+    const bool need_heal = obs.self_health < obs.self_max_health * 0.5f
+        && obs.self_health < heal_target;
+    if (!enemy_near6 && obs.self_gems <= 10 && (need_heal || !recovered))
     {
         // fled_group prices the heal target against the pack that dealt
         // the damage — the group we're standing in, not the route
@@ -703,14 +886,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // target stays the better guess.
         if (mem.state != State::pitstop)
             mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
-                && !threat ? (here >= 0 ? here : mem.active_target) : -1;
-        // Sortie watchdog: contested exits only — an attrition bail is
-        // paid-for progress (the pack keeps its wounds), while a bail
-        // under enemy reach buys nothing. Pure-grind maps would otherwise
+                ? (here >= 0 ? here : mem.active_target) : -1;
+        // Sortie watchdog: an attrition bail is paid-for progress (the
+        // pack keeps its wounds). Pure-grind maps would otherwise
         // blacklist their only work. A camp that died mid-sortie (reward
         // or respawn already visible) is a success either way.
         if ((mem.state == State::travel || mem.state == State::clear)
-            && mem.active_target >= 0 && threat)
+            && mem.active_target >= 0)
         {
             const CampObs* c = seen(obs, mem.active_target);
             const bool died = c
@@ -729,7 +911,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             }
         }
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
-        bool exposed = threat;
+        bool exposed = enemy_near6;
         for (const auto& c : visible_camps())
             if (!exposed && c.health() > 0 && c.strength() > 0
                 && pos.chebyshev_distance(c.position()) <= c.attack_range())
@@ -741,8 +923,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         return done(State::pitstop, Move{ cambc::map::spawn_region(cambc::team::ally) }, obs);
     }
-
-    const auto blocked = blocked_tiles();
 
     // Bank trigger: with a compiled route the plan's role bag_cap adds an
     // early divert threshold on top of econ's; when it fires, the route's
@@ -762,46 +942,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // tightens it (a role carrying past its splice point banks early).
     const bool bank_now = over_cap || econ::should_tribute(obs);
     if (bank_now)
-    {
-        cambc::vec2 nearest{}, locked{};
-        std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
-        std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
-        cambc::bitboard rings;
-        const auto altars = cambc::map::altars().positions();
-        // A locked route altar falls back to the nearest unlocked one.
-        if (preferred >= 0 && cambc::vision::has_altar_lock(altars[preferred])) preferred = -1;
-        for (std::size_t a = 0; a < altars.size(); ++a)
-        {
-            const auto altar = altars[a];
-            // The route's spliced ALTAR stop is the planned tribute point:
-            // while it stands unlocked, other altars don't compete.
-            if (preferred >= 0 && static_cast<std::int32_t>(a) != preferred) continue;
-            // An enemy lock turns the tribute attempt into a lock attack
-            // (GameRules §Tributing against a lock) — taking the nearest
-            // locked altar still clears it, while our own locks never block
-            // us and unlocked altars always win the pick.
-            const bool enemy_locked = cambc::vision::has_altar_lock(altar)
-                && cambc::vision::altar_lock_at(altar).is_enemy();
-            rings.draw_chebyshev(altar, cambc::constants::submit_gems_range);
-            if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < nearest_d)
-            {
-                nearest_d = d;
-                nearest = altar;
-            }
-            else if (enemy_locked && d < locked_d)
-            {
-                locked_d = d;
-                locked = altar;
-            }
-        }
-        if (nearest_d <= cambc::constants::submit_gems_range)
-            return done(State::bank, Channel{ Channel::Kind::tribute, nearest }, obs);
-        if (locked_d <= cambc::constants::submit_gems_range)
-            return done(State::bank, Channel{ Channel::Kind::tribute, locked }, obs);
-        rings &= ~blocked;
-        if (!rings.is_empty()) // every approach tile occupied: bank later
-            return done(State::bank, Move{ std::move(rings) }, obs);
-    }
+        if (const auto act = bank_toward(obs, preferred, blocked))
+            return done(State::bank, *act, obs);
 
     // Route step. With a compiled route: cyclic scan from the cursor — the
     // first actionable CAMP stop wins, ALTAR/PITSTOP stops are splice markers

@@ -60,8 +60,9 @@ struct Wait {};
 
 using Action = std::variant<Move, Attack, Cast, Channel, Buy, UseItem, Wait>;
 
-// Guard order: channel-continuation → tactic::offer → capture-stay →
-// pitstop → bank → route (contested/respawning filtered) → haul → idle.
+// Guard order: channel-continuation → tactic::offer → fight-or-flight →
+// capture-stay → pitstop → bank → route (contested/respawning filtered)
+// → haul → idle.
 // Ledger access is the ledger:: table itself — read-only from here.
 [[nodiscard]] Action tick(const Obs& obs, const Plan& plan);
 

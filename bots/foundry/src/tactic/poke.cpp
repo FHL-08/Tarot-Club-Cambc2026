@@ -1,14 +1,12 @@
 // poke — last refusal in the tactic chain: when no module interdicts,
 // spend the basic attack a turn already allows rather than waste it.
 #include "tactic.h"
+#include "support.h"
 
 std::optional<exec::Action> tactic::poke(const Obs& obs)
 {
     const auto& me = cambc::self();
     if (!me.can_attack()) return std::nullopt;
-    // Below the pitstop line the retreat owns the turn — trading it for
-    // poke is how a hurt champion gets chain-killed.
-    if (obs.self_health < obs.self_max_health * 0.6f) return std::nullopt;
     const auto attack_tiles = me.attack_tiles();
     const EnemyObs* best = nullptr;
     for (const auto& e : obs.enemies)
@@ -23,5 +21,10 @@ std::optional<exec::Action> tactic::poke(const Obs& obs)
         if (better) best = &e;
     }
     if (!best) return std::nullopt;
+    // Poke picks a fight, so it answers to the same kill race the
+    // fight-or-flight arm runs (issue #39): only fire when the target's
+    // TTK clearly beats our TTD — losing the race hands the killer the
+    // carried bag plus 50g (GameRules §Death).
+    if (time_to_kill(*best) > time_to_die(obs) * 0.9f) return std::nullopt;
     return exec::Attack{ best->position, exec::Attack::Kind::champion };
 }

@@ -144,4 +144,94 @@ inline void alarm_contested(const Obs& obs, int group)
     wire_merge(obs, [&](wire::Frame& f) { f.contested_camp = static_cast<std::uint8_t>(group); });
 }
 
+// Kill-race primitives (issue #39): the win condition is 1000 banked
+// gems, so survival matters only as bag custody — a body that dies after
+// banking lost nothing, while a dead carrier hands the killer the bag
+// plus 50g (GameRules §Death). dps is damage per own turn at reach
+// attack_range + 1 (one step closes the gap next turn).
+
+[[nodiscard]] inline float basic_dps_on(float strength, int attack_range,
+    cambc::vec2 from, cambc::vec2 to)
+{
+    return from.chebyshev_distance(to) <= attack_range + 1 ? strength : 0;
+}
+
+// Enemy ability cooldowns aren't readable per-slot; amortise 2×focus over
+// the 8-turn cooldown, the same burst term my_dps uses for our kits. The
+// whole term is reach-gated — a visible enemy that can't close next turn
+// is no threat at all.
+[[nodiscard]] inline float enemy_dps_on(const EnemyObs& e, cambc::vec2 target)
+{
+    if (e.position.chebyshev_distance(target) > e.attack_range + 1) return 0;
+    return e.strength + 2.f * e.focus / 8.f;
+}
+
+// Our own slots are readable: basic term plus the best ready damage
+// payload on this target — one cast per turn, so it's max, not a sum.
+[[nodiscard]] inline float self_dps_on(const cambc::champion& target)
+{
+    const auto& me = cambc::self();
+    float dps = basic_dps_on(me.strength(), me.attack_range(), me.position(), target.position());
+    float burst = 0;
+    for (const auto& ab : me.abilities())
+        if (ab.is_ready() && (ab.is_damage() || ab.is_aoe_damage()))
+            burst = std::max(burst, ab.damage_amount(target));
+    return dps + burst;
+}
+
+// Ally live reads are vision-gated (engine error 97 past ~8 tiles) — an
+// unreadable ally contributes nothing rather than faulting the turn.
+[[nodiscard]] inline float ally_dps_on(const cambc::champion& ally, cambc::vec2 target)
+{
+    try
+    {
+        return basic_dps_on(ally.strength(), ally.attack_range(), ally.position(), target);
+    }
+    catch (const cambc::error&) { return 0; }
+}
+
+// All visible enemy dps landing on `target` next turn.
+[[nodiscard]] inline float incoming_dps(const Obs& obs, cambc::vec2 target)
+{
+    float total = 0;
+    for (const auto& e : obs.enemies)
+        if (e.health > 0) total += enemy_dps_on(e, target);
+    return total;
+}
+
+// Turns until incoming damage kills the body; infinite when nobody can
+// reach it.
+[[nodiscard]] inline float time_to_die(const Obs& obs)
+{
+    const float incoming = incoming_dps(obs, obs.self_pos);
+    return incoming > 0 ? obs.self_health / incoming
+        : std::numeric_limits<float>::infinity();
+}
+
+// Our side's dps on a visible enemy: self basic+burst plus every readable
+// ally's basic term.
+[[nodiscard]] inline float our_dps_on(const EnemyObs& e)
+{
+    const auto& me = cambc::self();
+    float dps = basic_dps_on(me.strength(), me.attack_range(), me.position(), e.position);
+    try
+    {
+        if (const auto handle = cambc::vision::champion_at(e.position); handle.is_visible())
+            dps = self_dps_on(handle);
+    }
+    catch (const cambc::error&) { }
+    for (const auto& ally : cambc::champions(cambc::team::ally))
+    {
+        if (ally == me) continue;
+        dps += ally_dps_on(ally, e.position);
+    }
+    return dps;
+}
+
+[[nodiscard]] inline float time_to_kill(const EnemyObs& e)
+{
+    const float dps = our_dps_on(e);
+    return dps > 0 ? e.health / dps : std::numeric_limits<float>::infinity();
+}
+
 } // namespace tactic

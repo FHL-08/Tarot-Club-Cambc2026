@@ -13,6 +13,9 @@ struct EnemyObs {
     cambc::vec2 position{};
     cambc::champion_type type{};
     float health = 0, max_health = 0;
+    // Live combat stats feed the kill-race estimate (issue #39).
+    float strength = 0, focus = 0;
+    std::int32_t attack_range = 1;
     std::uint32_t gems = 0;          // carried bag: killer inherits it +50g
     bool submitting = false;         // channelling tribute right now
     std::int32_t channel_left = 0;   // rounds left on that channel (0 when not submitting)
@@ -58,6 +61,9 @@ struct Obs {
         seen.type = enemy.champion_name();
         seen.health = enemy.health();
         seen.max_health = enemy.max_health();
+        seen.strength = enemy.strength();
+        seen.focus = enemy.focus();
+        seen.attack_range = enemy.attack_range();
         seen.gems = enemy.gem_count();
         seen.submitting = enemy.is_submitting_gems();
         // remaining_channel_time throws when no channel is active.
