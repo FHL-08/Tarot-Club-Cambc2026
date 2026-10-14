@@ -13,7 +13,8 @@ CTYPE = ["ryth", "vesper", "vendetta", "cassi", "issac", "stellar", "prism", "ma
 MOVE, ATTACK, CAST, YIELD, CHANNEL, SHOP = 4, 5, 6, 9, 11, 13
 METRICS = ["firstCapture", "gems<=r100", "sg@100", "sg@200", "sg@300", "firstTribute", "tributes", "tribBag",
            "campCoHit", "cassiIssacDist", "nearestAlly", "allyWithin2", "enemyHalf", "idle",
-           "deaths<=r150", "deaths", "champDmg", "killsEnemyHalf", "killsOwnHalf"]
+           "recalls", "recallHpPct", "deaths<=r150", "deaths", "deathsBelowFloor", "deathsToChampions",
+           "gemsLostOnDeath", "champDmg", "killsEnemyHalf", "killsOwnHalf"]
 
 
 def cheb(a, b):
@@ -30,6 +31,13 @@ def features(tr, team):
     sp = {t: tuple(sum(v) / len(v) for v in zip(*[(c[3], c[4]) for c in C0 if c[0] == t])) for t in (0, 1)}
     own = lambda pos: math.dist(pos, sp[team]) < math.dist(pos, sp[1 - team])
     f, cnt = defaultdict(float), defaultdict(int)
+    spawn = {(c[3], c[4]) for c in C0 if c[0] == team}
+    champ_hits = defaultdict(int)
+    for x in tr["actions"]:
+        if x[1] not in me:
+            for h in x[9]:
+                if h[0] == "c" and h[1] in me:
+                    champ_hits[(h[1], x[0])] += h[2]
     for chk in (100, 200, 300):
         f[f"sg@{chk}"] = next((r for r in R if r["r"] >= chk), R[-1])["sg"][team]
     tribs = [b["sg"][team] - a["sg"][team] for a, b in zip(R, R[1:]) if b["sg"][team] > a["sg"][team]]
@@ -44,8 +52,16 @@ def features(tr, team):
                 if b["r"] <= 100:
                     f["gems<=r100"] += gained
         for i in me:
-            if a["c"][i][2] and not b["c"][i][2]:
+            ca, cb = a["c"][i], b["c"][i]
+            if ca[2] and not cb[2]:
                 f["deaths"] += 1; f["deaths<=r150"] += b["r"] <= 150
+                # the 40% line is exec's retreat floor — dying under it means the retreat came too late
+                f["deathsBelowFloor"] += ca[5] < 0.4 * ca[6]
+                f["deathsToChampions"] += any(champ_hits[(i, r)] for r in range(b["r"] - 3, b["r"] + 1))
+                f["gemsLostOnDeath"] += ca[7]
+            # a recall is a teleport onto our own spawn while staying alive (walking never covers >3 tiles a round)
+            if ca[2] and cb[2] and ca[3] >= 0 and (cb[3], cb[4]) in spawn and cheb((ca[3], ca[4]), (cb[3], cb[4])) > 3:
+                f["recalls"] += 1; f["recallHpPct"] += 100 * ca[5] / max(1, ca[6]); cnt["recallHpPct"] += 1
         for i, c in enumerate(a["c"]):
             if c[0] != team and c[2] and not b["c"][i][2] and c[3] >= 0:
                 f["killsEnemyHalf" if not own((c[3], c[4])) else "killsOwnHalf"] += 1
