@@ -98,6 +98,9 @@ struct Mem {
     std::array<std::uint8_t, 8> owned{};   // 64-group mask of the route's CAMP stops
     std::uint8_t cursor = 0;               // cyclic scan position in route
     int active_target = -1;                // in-flight route target — hysteresis anchor
+    int sector_start = -1;                 // round the home sector took effect (-1 = opening still running)
+    int sector_id = -1;                    // this body's wedge index
+    bool sector_on = false;                // sector_start set and within its 150-round window
 };
 Mem mem;
 
@@ -194,12 +197,24 @@ void bind_plan(const Plan& plan)
 // partition under it still gives every group exactly one fallback owner —
 // unrouted camps (monolith-adjacent, above the solo floor) would otherwise
 // be owned by nobody and never ground down.
+const std::vector<int>& unit_of_slot();
+int unit_count();
+const std::vector<int>& group_wedge();
+
 bool mine(int g)
 {
     const int stride = std::max(1, std::min(mem.allies, static_cast<int>(groups().size())));
     if (g >= 0 && g % stride == mem.slot % stride) return true;
     if (mem.have_route)
-        return g < 64 && ((mem.owned[g >> 3] >> (g & 7)) & 1);
+    {
+        if (g < 64 && ((mem.owned[g >> 3] >> (g & 7)) & 1)) return true;
+    }
+    // Sector window (#74): a gem camp inside this body's wedge is
+    // temporarily "ours" — out-of-wedge camps stay reachable via
+    // open_nearby but lose the near-tie by the +6 in consider().
+    if (mem.sector_on && g >= 0 && g < static_cast<int>(groups().size())
+        && groups()[g].gems > 0)
+        return group_wedge()[static_cast<std::size_t>(g)] == mem.sector_id;
     return false;
 }
 
@@ -352,6 +367,97 @@ int opening_stop(int index)
         origin = geos[best].tiles;
     }
     return static_cast<int>(stops.size()) > index ? stops[index] : -1;
+}
+
+// Post-opening home sectors (issue #74): when the grouped chain ends each
+// unit takes an angular wedge around our spawn centroid, measured from the
+// direction toward the enemy spawn centroid, so the first 150 routing
+// rounds fan coverage over the map instead of clumping on the partition.
+// Everything derives from statics (spawn regions, group tiles, draft
+// record), so every body agrees on unit order and wedge bounds without
+// the wire. C&I's twins share the lower slot's unit.
+const std::vector<int>& unit_of_slot()
+{
+    static const std::vector<int> v = [] {
+        std::vector<int> types;
+        for (const auto pick : cambc::draft::current_draft(cambc::team::ally))
+        {
+            const auto raw = static_cast<std::int32_t>(pick);
+            if (pick == cambc::champion_draft::cassi_and_issac)
+            {
+                types.push_back(static_cast<int>(cambc::champion_type::cassi));
+                types.push_back(static_cast<int>(cambc::champion_type::issac));
+            }
+            else
+            {
+                types.push_back(
+                    raw + (raw > static_cast<std::int32_t>(cambc::champion_draft::cassi_and_issac) ? 1 : 0));
+            }
+        }
+        std::vector<int> out(types.size(), 0);
+        int unit = 0;
+        for (std::size_t i = 0; i < types.size(); ++i)
+        {
+            if (types[i] == static_cast<int>(cambc::champion_type::issac) && i > 0
+                && types[i - 1] == static_cast<int>(cambc::champion_type::cassi))
+                out[i] = out[i - 1];
+            else
+                out[i] = unit++;
+        }
+        return out;
+    }();
+    return v;
+}
+
+int unit_count()
+{
+    static const int k = 1 + *std::max_element(unit_of_slot().begin(), unit_of_slot().end());
+    return k;
+}
+
+const cambc::vec2& spawn_centroid(cambc::team side)
+{
+    static const cambc::vec2 c[2] = { [] {
+            const auto tiles = turn::spawn_region(cambc::team::ally).positions();
+            std::int64_t x = 0, y = 0;
+            for (const auto t : tiles) { x += t.x; y += t.y; }
+            return cambc::vec2{ static_cast<int>(x / tiles.size()), static_cast<int>(y / tiles.size()) };
+        }(), [] {
+            const auto tiles = turn::spawn_region(cambc::team::enemy).positions();
+            std::int64_t x = 0, y = 0;
+            for (const auto t : tiles) { x += t.x; y += t.y; }
+            return cambc::vec2{ static_cast<int>(x / tiles.size()), static_cast<int>(y / tiles.size()) };
+        }() };
+    return c[side == cambc::team::enemy ? 1 : 0];
+}
+
+// Wedge of a direction from the ally spawn centroid: angle rel-ordered
+// from the enemy-direction so wedge 0 sits toward the enemy side.
+int wedge_of(cambc::vec2 p)
+{
+    const auto a = spawn_centroid(cambc::team::ally), e = spawn_centroid(cambc::team::enemy);
+    const double ref = std::atan2(static_cast<double>(e.y - a.y), static_cast<double>(e.x - a.x));
+    double ang = std::atan2(static_cast<double>(p.y - a.y), static_cast<double>(p.x - a.x)) - ref;
+    while (ang < 0) ang += 2.0 * M_PI;
+    while (ang >= 2.0 * M_PI) ang -= 2.0 * M_PI;
+    const int k = unit_count();
+    return std::min(k - 1, static_cast<int>(ang / (2.0 * M_PI) * k));
+}
+
+const std::vector<int>& group_wedge()
+{
+    static const std::vector<int> v = [] {
+        std::vector<int> out;
+        for (const auto& g : groups())
+        {
+            std::int64_t x = 0, y = 0;
+            for (const auto t : g.tile_list) { x += t.x; y += t.y; }
+            out.push_back(wedge_of(cambc::vec2{ static_cast<int>(x / g.tile_list.size()),
+                static_cast<int>(y / g.tile_list.size()) }));
+        }
+        return out;
+    }();
+    return v;
 }
 
 bool enemy_on(int g, const Obs& obs)
@@ -921,8 +1027,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // gate already guarantees they clear inside one bar.
         const float sorties = geos[g].passive ? 0.0f
             : geos[g].dps * (geos[g].health / my_dps()) / (obs.self_max_health * 0.65f);
+        // Out-of-sector penalty while the home-wedge window runs: in-wedge
+        // camps keep their raw cost and win ties and near-ties.
         const auto cost = dist_to(geos[g], pos)
-            + static_cast<std::int64_t>(sorties * 60.0f);
+            + static_cast<std::int64_t>(sorties * 60.0f)
+            + (mem.sector_on && group_wedge()[static_cast<std::size_t>(g)] != mem.sector_id ? 6 : 0);
         if (g == mem.active_target) { active_state = reward ? 2 : 1; active_cost = cost; }
         int& bt = geos[g].gems ? target : gold_target;
         bool& br = geos[g].gems ? target_reward : gold_reward;
@@ -989,6 +1098,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 consider(static_cast<int>(g), -1, relaxed);
     };
 
+    // Sector bookkeeping (#74): the sector starts the round the opening
+    // chain finishes (or round 91 when it was never needed), runs 150
+    // rounds, then hands routing back to the plain partition.
+    bool chain_done = false;
     // Grouped opening (issue #38): while the chain has an unfinished stop
     // it overrides the route scan — the first gem packs are cleared
     // together, which is where the platform openings were being lost.
@@ -1023,6 +1136,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             }
             return -1;
         };
+        if (open_stop(-1) < 0) chain_done = true;
         for (int oi = open_stop(-1); oi >= 0; oi = open_stop(oi))
         {
             const int g = opening_stop(oi);
@@ -1067,6 +1181,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             return done(State::travel, Move{ free_tiles }, obs);
         }
     }
+
+    if (mem.sector_start < 0 && (chain_done || obs.round > 90))
+        mem.sector_start = static_cast<int>(obs.round);
+    mem.sector_on = mem.sector_start >= 0 && obs.round <= mem.sector_start + 150;
+    if (mem.sector_on && mem.sector_id < 0)
+        mem.sector_id = my_slot() < static_cast<int>(unit_of_slot().size())
+            ? unit_of_slot()[static_cast<std::size_t>(my_slot())] : 0;
 
     bool desperate = false;
     if (target < 0)
