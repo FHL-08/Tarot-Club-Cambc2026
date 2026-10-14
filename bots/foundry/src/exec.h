@@ -28,7 +28,8 @@ struct Attack {
     Kind kind = Kind::camp;
 };
 
-// Ability slot cast: ground → use(tile), unit → resolved at `target`.
+// Ability slot cast: ground → use(tile), otherwise a unit (camp or
+// champion) resolved at `target` in apply().
 struct Cast {
     std::uint8_t slot = 0;
     cambc::vec2 target{};
