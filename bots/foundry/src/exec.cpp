@@ -50,6 +50,13 @@ constexpr int max_recall_retries = 3;
 constexpr int strike_limit = 3;
 constexpr std::uint32_t strike_cooldown = 200;
 
+// Retreat floor: the share of max hp that ends a sortie — the `dying`
+// pitstop trigger and the heal-to-need release both price off it. A
+// release reserve below it would discharge a body the dying check
+// re-traps the very next turn, and a sortie budgeted to a lower floor
+// lands its last hit already past the bail line.
+constexpr float retreat_floor = 0.40f;
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -194,21 +201,28 @@ bool mine(int g)
 
 // Sustained camp damage per turn for this body — the same estimate the
 // planner prices routes with (planner.cpp kit_for): basic output plus one
-// ability amortised over the 8-turn slot cooldown, a ranged kit's nuke
-// worth ~2x focus, a melee reset worth one extra basic. Design stats are
-// fixed per champion, so the host lookup runs once.
+// camp-damage ability amortised over the 8-turn slot cooldown, a ranged
+// kit's nuke worth ~2x focus, a melee payload one extra basic. The burst
+// term needs a materialised damage slot — attack_reset/heal kits (Vesper
+// Vale, Willow) have zero castable camp damage, and camp_cast never emits
+// those kinds. Design stats are fixed per champion, so the host lookup
+// runs once.
 float my_dps()
 {
     static const float dps = [] {
-        const auto stats = cambc::self().base_stats();
+        const auto& me = cambc::self();
+        const auto stats = me.base_stats();
         const float basic = stats.base_strength * stats.camp_damage_multiplier;
-        const float burst = stats.base_attack_range > 1 ? 2.0f * stats.base_focus : basic;
+        float burst = 0;
+        for (const auto& ab : me.abilities())
+            if (ab.is_damage() || ab.is_aoe_damage())
+                burst = stats.base_attack_range > 1 ? 2.0f * stats.base_focus : basic;
         return basic + burst / 8.0f;
     }();
     return dps;
 }
 
-// The planner's per-kit solo check at runtime (planner.cpp:204 mirror):
+// The planner's per-kit solo check at runtime (planner.cpp:256-258 mirror):
 // pack retaliation across one full clear is site.dps × turns-to-clear, and
 // a camp that burns ≥2 health bars is a trap — the sortie loop leaves the
 // body dead or commuting, never collecting (lanes: every elk is unrouted
@@ -421,13 +435,15 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
     // Tactic modules make their own live reads (buffs, consumables, a
     // recaller query per enemy) — a stale read there must not fault the
-    // turn, only skip the offer.
+    // turn, only skip the offer. std::exception, not just cambc::error:
+    // a module's own bad_variant_access/out_of_range would otherwise
+    // escape to the whole-tick catch and cost the turn, not the offer.
     try
     {
         if (const auto offer = tactic::offer(obs))
             return done(State::tactic, *offer, obs);
     }
-    catch (const cambc::error&) { }
+    catch (const std::exception&) { }
 
     const auto& geos = groups();
     const cambc::vec2 pos = obs.self_pos;
@@ -443,7 +459,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
                 || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
             mem.strikes[c.group] = 0;
-    // Snapshot live member hp/dps sums — camps don't regen, so the last
+    // Snapshot live member hp/dps sums — rebuilt each round from the
+    // members currently in vision, so an edge-of-vision sighting
+    // overwrites a fuller read with the subset sum and heal_target
+    // under-prices the real pack (a known under-estimate, tolerated: the
+    // miss only releases a sortie early). Camps don't regen, so a full
     // read stays exact until someone else touches the pack.
     for (const auto& c : visible_camps())
     {
@@ -470,7 +490,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     bool threat = false;
     for (const auto& e : obs.enemies)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
-    const bool dying = obs.self_health < obs.self_max_health * 0.40f;
+    const bool dying = obs.self_health < obs.self_max_health * retreat_floor;
     const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
 
     // A recall we emitted that never shows in champion_state was cancelled
@@ -530,10 +550,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // retreat below 75% — re-checking `unsafe` each turn flickers between
     // TRAVEL and PITSTOP when a threat pops in and out of vision.
     // Heal-to-need: a return sortie's spendable budget is capped by the
-    // ~35% bail floor, so healing past (expected retaliation + floor) buys
-    // nothing — at ~10hp/turn that dead wait is the dominant sortie cost
-    // on a camp the last sortie already chewed. Champion scares and
-    // non-sortie exits heal full: the commute itself stays dangerous.
+    // retreat floor, so healing past (expected retaliation + floor) buys
+    // nothing — spawn heals to full at turn end (GameRules §Recalling),
+    // so every surplus point waited on costs a whole turn of commute on a
+    // camp the last sortie already chewed. Champion scares and non-sortie
+    // exits heal full: the commute itself stays dangerous.
     float heal_target = obs.self_max_health * 0.9f;
     if (mem.fled_group >= 0 && mem.fled_group < static_cast<int>(geos.size()))
     {
@@ -541,7 +562,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         const float hp_left = left.hp >= 0 ? left.hp : geos[mem.fled_group].health;
         const float dps_left = left.hp >= 0 ? left.dps : geos[mem.fled_group].dps;
         if (hp_left > 0)
-            heal_target = std::min(heal_target, obs.self_max_health * 0.35f
+            heal_target = std::min(heal_target, obs.self_max_health * retreat_floor
                 + dps_left * std::max(1.0f, hp_left / my_dps()) * 1.25f);
     }
     // Pitstop release: mid-retreat stays sticky below 75% (re-checking
@@ -552,9 +573,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                      : obs.self_health >= obs.self_max_health * 0.75f);
     if (unsafe || !recovered)
     {
+        // fled_group prices the heal target against the pack that dealt
+        // the damage — the group we're standing in, not the route
+        // destination. Off the tiles (ranged ring, mid-commute) the active
+        // target stays the better guess.
         if (mem.state != State::pitstop)
             mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
-                && !threat ? mem.active_target : -1;
+                && !threat ? (here >= 0 ? here : mem.active_target) : -1;
         // Sortie watchdog: contested exits only — an attrition bail is
         // paid-for progress (the pack keeps its wounds), while a bail
         // under enemy reach buys nothing. Pure-grind maps would otherwise
@@ -687,11 +712,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         scanned |= 1ull << g;
         // The unfit gate must sit ahead of the active-target mark below:
         // a camp this body can't solo has to drop out of hysteresis, not
-        // ride the +8 margin into another doomed sortie.
+        // ride the +8 margin into another doomed sortie. But it sits BEHIND
+        // the lifecycle read: a pending reward has no fight left to be
+        // unfit for — crossfire kills leave free five-round captures the
+        // owner never fought, and gating those leaks the reward entirely.
         if (geos[g].monolith) return;
-        if (geos[g].gems && !unfit(geos[g], obs.self_max_health)) ++fit_gem_supply;
+        const bool is_unfit = unfit(geos[g], obs.self_max_health);
+        if (geos[g].gems && !is_unfit) ++fit_gem_supply;
         if (unreachable(g, obs.round)) return;
-        if (unfit(geos[g], obs.self_max_health) && !relaxed) return;
         bool reward = false;
         if (const CampObs* c = seen(obs, g))
         {
@@ -706,6 +734,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         else if (ledger::ready_round(g) > static_cast<std::int32_t>(obs.round))
             return;
+        if (is_unfit && !reward && !relaxed) return;
         // Cost ≈ commute + expected sortie churn: each sortie spends a
         // recall, a heal and a return walk (~80t at speed 1), so a passive
         // cluster two screens away beats a three-sortie wolf next door
@@ -861,10 +890,22 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // belief alone never flags. Unreachable and unsoloable groups are
     // legitimately idle.
     return done(State::idle, Wait{}, obs);
-    } catch (const std::exception&)
+    } catch (const std::exception& err)
     {
         // A stale live read mid-decision costs this turn only — same as
-        // the engine-side fizzle policy apply() already follows.
+        // the engine-side fizzle policy apply() already follows. A
+        // deterministic throw would otherwise surface as a bare per-turn
+        // Wait — an idle body with zero diagnostics — so echo the fault
+        // the way play_turn's catch would. Rate-limited and fuel-floored:
+        // a starved turn can't afford the write.
+        static std::uint32_t next_log = 0;
+        if (obs.round >= next_log && !cambc::is_draft()
+            && cambc::fuel_remaining() >= 4000)
+        {
+            next_log = obs.round + 40;
+            std::cout << "bot error: exec::tick r" << obs.round
+                      << ": " << err.what() << '\n';
+        }
         return exec::Wait{};
     }
 }
