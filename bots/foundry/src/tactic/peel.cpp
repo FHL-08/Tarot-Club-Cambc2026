@@ -55,7 +55,8 @@ Interrupts interrupts()
             kit.cc_range = ab.get<cambc::ability_cc>().range;
             kit.cc_ground = ab.can_target_ground() && !ab.can_target_enemies();
         }
-        else if (ab.is_attack_reset() && ab.get<cambc::ability_attack_reset>().enhanced_attack)
+        else if (ab.is_attack_reset() && ab.get<cambc::ability_attack_reset>().enhanced_attack
+                 && ab.can_target_self())
         {
             kit.prime_slot = static_cast<int>(s);
         }
@@ -150,13 +151,21 @@ std::optional<exec::Action> tactic::peel(const Obs& obs)
         }
     }
 
-    // Unreachable this turn — flag the running channel on the wire.
-    if (targets.front().tribute)
+    // Unreachable this turn — flag the best tribute channel on the wire.
+    // The sorted order means a high-scoring recaller must not mask a lower
+    // tribute: scan for the first tribute, not just the top pick.
+    for (const auto& t : targets)
+    {
+        if (!t.tribute) continue;
+        bool raised = false;
         for (const auto altar : altars())
-            if (targets.front().pos.chebyshev_distance(altar) <= cambc::constants::submit_gems_range)
+            if (t.pos.chebyshev_distance(altar) <= cambc::constants::submit_gems_range)
             {
                 alarm_channel(obs, altar_index(altar));
+                raised = true;
                 break;
             }
+        if (raised) break; // alarm once — the highest-scored visible tribute
+    }
     return std::nullopt;
 }

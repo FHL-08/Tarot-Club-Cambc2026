@@ -21,7 +21,8 @@ namespace {
 
 // Per-champion claim memory: a reward_available group with an enemy on its
 // tiles is being captured by them — marked enemy-owned until the group is
-// seen alive again. Pure function of the observation history.
+// seen alive again or recomputed enemy-free (our own capture clearing the
+// mark keeps us off our own respawn). Pure function of observation history.
 std::vector<char>& enemy_owned()
 {
     static std::vector<char> owned;
@@ -30,13 +31,16 @@ std::vector<char>& enemy_owned()
     return owned;
 }
 
-// Contests and parks trade our turns for theirs one-for-one — the hold is
-// capped so a permanent standoff can't starve the route.
-constexpr int hold_cap = 8;
-int& hold_streak()
+// Per-group session budget: each hold spends one charge, refilled only when
+// the group is seen alive again — a standoff can never spend more than the
+// budget's worth of route slack on a single enemy claim.
+constexpr int hold_budget = 8;
+std::vector<int>& budget()
 {
-    static int streak = 0;
-    return streak;
+    static std::vector<int> b;
+    if (b.size() != tactic::groups().size())
+        b.assign(tactic::groups().size(), hold_budget);
+    return b;
 }
 
 bool enemy_on(const Obs& obs, int g)
@@ -55,16 +59,29 @@ bool reward_pending(const CampObs& c)
 
 std::optional<exec::Action> tactic::deny(const Obs& obs)
 {
-    if (obs.self_health < obs.self_max_health * 0.45f) return std::nullopt;
+    // Aligns with exec's threatened-pitstop rule: deny is pure gravy, so a
+    // hurt champion with an enemy in reach keeps fleeing instead of holding.
+    bool threatened = false;
+    for (const auto& e : obs.enemies)
+        if (obs.self_pos.chebyshev_distance(e.position) <= 3) { threatened = true; break; }
+    if (obs.self_health < obs.self_max_health * 0.45f
+        || (threatened && obs.self_health < obs.self_max_health * 0.6f))
+        return std::nullopt;
     const int here = tactic::group_of(obs.self_pos);
 
-    // Refresh claim marks from this turn's snapshot.
+    // Refresh claim marks and budgets from this turn's snapshot.
     for (const auto& c : obs.camps)
     {
         if (std::holds_alternative<cambc::map::camp_group_alive>(c.state))
+        {
             enemy_owned()[c.group] = 0;
-        else if (reward_pending(c) && enemy_on(obs, c.group))
-            enemy_owned()[c.group] = 1;
+            budget()[c.group] = hold_budget;
+        }
+        else if (reward_pending(c))
+            // Recompute every sighting: an enemy on the region claims it;
+            // no enemy (our capture in progress, or theirs already done)
+            // un-marks so the park branch never holds our own respawn.
+            enemy_owned()[c.group] = enemy_on(obs, c.group) ? 1 : 0;
     }
 
     // Stepping off a reward tile forfeits the capture standing on it —
@@ -84,23 +101,23 @@ std::optional<exec::Action> tactic::deny(const Obs& obs)
         if (here == g)
         {
             // Already holding the contest — stay only while no other ally
-            // covers it and the streak cap lasts.
-            if (allies_on <= 1 && hold_streak() < hold_cap)
+            // covers it and the group's budget still has charge.
+            if (allies_on <= 1 && budget()[g] > 0)
             {
-                ++hold_streak();
+                --budget()[g];
                 tactic::alarm_contested(obs, g);
                 std::cout << "TACTIC deny: contest @r" << obs.round << '\n';
                 return exec::Wait{};
             }
             continue;
         }
-        if (on_reward || allies_on > 0 || hold_streak() >= hold_cap) continue;
+        if (on_reward || allies_on > 0 || budget()[g] <= 0) continue;
         cambc::bitboard step_in = region & ~tactic::blocked_tiles();
         bool adjacent = false;
         for (const auto tile : step_in.positions())
             if (obs.self_pos.chebyshev_distance(tile) == 1) { adjacent = true; break; }
         if (!adjacent) continue;
-        ++hold_streak();
+        --budget()[g];
         tactic::alarm_contested(obs, g);
         std::cout << "TACTIC deny: contest @r" << obs.round << '\n';
         return exec::Move{ std::move(step_in) };
@@ -109,17 +126,15 @@ std::optional<exec::Action> tactic::deny(const Obs& obs)
     // Park on an enemy-claimed group's tiles through the last rounds of its
     // countdown — occupation at the deadline pushes the respawn out.
     if (here >= 0 && enemy_owned()[static_cast<std::size_t>(here)]
-        && hold_streak() < hold_cap)
+        && budget()[static_cast<std::size_t>(here)] > 0)
         if (const CampObs* c = tactic::seen_camp(obs, here); c)
             if (const auto* r = std::get_if<cambc::map::camp_group_respawning>(&c->state);
                 r && r->timer <= 2)
             {
-                ++hold_streak();
+                --budget()[static_cast<std::size_t>(here)];
                 std::cout << "TACTIC deny: park @r" << obs.round << '\n';
                 return exec::Wait{};
             }
 
-    // Every denying path returns above — reaching here releases the streak.
-    hold_streak() = 0;
     return std::nullopt;
 }

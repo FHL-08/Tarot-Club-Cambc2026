@@ -53,6 +53,10 @@ std::int64_t loot_window(const EnemyObs& e, std::int64_t stationary)
 std::optional<exec::Action> tactic::gank(const Obs& obs)
 {
     const auto& me = cambc::self();
+    // Deliberately laxer than exec's threatened-60%: gank commits only when
+    // the kill is proven lethal this window, and a dead attacker is the
+    // safest exit — so the tactic yields only at exec's unconditional
+    // dying floor (45%), not at its under-threat recall trigger.
     if (obs.self_health < obs.self_max_health * 0.45f) return std::nullopt;
     if (obs.self_gems >= own_bag_limit) return std::nullopt;
 
@@ -94,7 +98,7 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
     }
 
     const EnemyObs* best = nullptr;
-    std::int64_t best_window = 0, best_my_eta = 0, best_my_hits = 0;
+    std::int64_t best_my_hits = 0;
     float best_others = 0, best_my_spell = 0;
     int best_spell_slot = -1;
     bool best_holder = false;
@@ -115,13 +119,13 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
             helpers.push_back({ pos, ally.strength(), ally.attack_range() });
         }
 
-        // One successful cast per turn — my burst adds only the best ready
-        // damaging ability, once.
-        int spell_slot = -1;
-        float spell_range = 0;
+        // Ready damaging/cc slots; the per-target pick below scores each by
+        // damage_amount — a long-range zero-damage cc must not shadow a
+        // shorter spell that actually hurts.
+        struct Spell { int slot; float range; };
+        std::vector<Spell> spells;
+        auto abilities = me.abilities(); // copy of the slot views — binds live owner handles
         if (me.can_cast())
-        {
-            const auto abilities = me.abilities(); // copy of the slot views — binds live owner handles
             for (std::uint32_t s = 0; s < 2; ++s)
             {
                 const auto& ab = abilities[s];
@@ -134,52 +138,51 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
                         return 0.f;
                     },
                     *ab.info());
-                if (r > spell_range) { spell_range = r; spell_slot = static_cast<int>(s); }
+                spells.push_back({ static_cast<int>(s), r });
             }
-        }
 
         for (const auto& cand : cands)
         {
             const EnemyObs& e = obs.enemies[cand.idx];
             // A channelled carrier stands still for the whole window — every
-            // helper hits once it walks into range. A runner only feeds hits
-            // to bodies already on top of it: melee at eta ≤ 1 shadows the
-            // rest of the way (same-speed pursuit never closes otherwise),
-            // ranged lands a short volley before the runner exits the bubble.
+            // helper hits once it walks into range, and the model is exact.
+            // A runner is different: the FSM emits ONE action per turn, so a
+            // body that has to chase spends its turn Moving while the
+            // same-speed target opens the gap again. The only provable
+            // damage is the in-range volley — one hit from each helper
+            // already inside its attack reach — plus one ability tick.
             float total = 0;
-            std::int64_t my_eta = 0, my_hits = 0;
+            std::int64_t my_hits = 0;
             std::size_t holder = 0;
             for (std::size_t h = 0; h < helpers.size(); ++h)
             {
                 Helper& helper = helpers[h];
                 helper.eta = std::max<std::int64_t>(0,
                     helper.pos.chebyshev_distance(e.position) - helper.range);
-                if (cand.stationary)
-                    helper.hits = std::max<std::int64_t>(0, cand.window - helper.eta);
-                else if (helper.range <= 1)
-                    helper.hits = helper.eta <= 1
-                        ? std::max<std::int64_t>(0, cand.window - helper.eta) : 0;
-                else
-                    helper.hits = helper.eta <= 4
-                        ? std::max<std::int64_t>(0, std::min<std::int64_t>(cand.window - helper.eta, 3))
-                        : 0;
+                helper.hits = cand.stationary
+                    ? std::max<std::int64_t>(0, cand.window - helper.eta)
+                    : (helper.eta == 0 ? 1 : 0);
                 total += helper.strength * static_cast<float>(helper.hits);
-                if (h == 0) { my_eta = helper.eta; my_hits = helper.hits; }
+                if (h == 0) my_hits = helper.hits;
                 if (helper.eta < helpers[holder].eta
                     || (helper.eta == helpers[holder].eta && helper.pos < helpers[holder].pos))
                     holder = h;
             }
 
             float my_spell = 0;
-            if (spell_slot >= 0
-                && obs.self_pos.chebyshev_distance(e.position) <= static_cast<std::int64_t>(spell_range))
+            int my_spell_slot = -1;
+            for (const auto& sp : spells)
             {
+                if (obs.self_pos.chebyshev_distance(e.position)
+                    > static_cast<std::int64_t>(sp.range))
+                    continue;
                 try
                 {
-                    my_spell = me.abilities()[static_cast<std::uint32_t>(spell_slot)]
-                                   .damage_amount(cambc::vision::champion_at(e.position));
+                    const float d = abilities[static_cast<std::uint32_t>(sp.slot)]
+                                        .damage_amount(cambc::vision::champion_at(e.position));
+                    if (d > my_spell) { my_spell = d; my_spell_slot = sp.slot; }
                 }
-                catch (const cambc::error&) { my_spell = 0; }
+                catch (const cambc::error&) { }
             }
             total += my_spell;
             if (total < e.health) continue; // not provably lethal — pass
@@ -188,13 +191,11 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
                 || (e.gems == best->gems && e.position < best->position))
             {
                 best = &e;
-                best_window = cand.window;
-                best_my_eta = my_eta;
                 best_my_hits = my_hits;
                 // Damage the target takes from everyone but me this window.
                 best_others = total - helpers[0].strength * static_cast<float>(my_hits) - my_spell;
                 best_my_spell = my_spell;
-                best_spell_slot = spell_slot;
+                best_spell_slot = my_spell_slot;
                 best_holder = holder == 0;
             }
         }
