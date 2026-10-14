@@ -388,17 +388,32 @@ bool enemy_on(int g, const Obs& obs)
 // fails (killed, knocked off its tile, or sitting past the vision edge
 // where the mask reads stale). A camp that fails is_visible() throws
 // error 97 on every stat read — skip it here so no caller has to.
-std::vector<cambc::camp> visible_camps()
+// The tick calls this several times and each rebuild is a camp_tiles()
+// mask plus a camp_at+is_visible pair per tile. Vision only changes
+// between rounds or when this body itself moved (post-move apply), so
+// memoise on (round, body, position).
+const std::vector<cambc::camp>& visible_camps()
 {
-    std::vector<cambc::camp> out;
+    static std::vector<cambc::camp> cache;
+    static std::uint32_t cached_round = 0;
+    static int cached_name = -1;
+    static cambc::vec2 cached_pos{};
+    const auto& me = cambc::self();
+    const auto pos = me.position();
+    const auto round = cambc::round_number();
+    const int name = static_cast<int>(me.champion_name());
+    if (round == cached_round && name == cached_name && pos == cached_pos)
+        return cache;
+    cached_round = round; cached_name = name; cached_pos = pos;
+    cache.clear();
     for (const auto& tile : cambc::vision::camp_tiles().positions())
         try
         {
             const auto c = cambc::vision::camp_at(tile);
-            if (c.is_visible()) out.push_back(c);
+            if (c.is_visible()) cache.push_back(c);
         }
         catch (const cambc::error&) { }
-    return out;
+    return cache;
 }
 
 // Same mask-vs-entity gap for champions: a teleporter or fresh corpse can
