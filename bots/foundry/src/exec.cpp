@@ -59,6 +59,7 @@ constexpr std::uint32_t strike_cooldown = 200;
 // re-traps the very next turn, and a sortie budgeted to a lower floor
 // lands its last hit already past the bail line.
 constexpr float retreat_floor = 0.55f;
+constexpr std::int64_t opportunity_range = 6;
 
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
@@ -949,11 +950,43 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                     consider(stop.index, static_cast<std::int8_t>(idx), relaxed);
             }
         }
+        // Opportunistic reach: a gem camp a few tiles outside the
+        // partition is closer than the assigned share — claim it unless a
+        // readable ally is already on its tiles (clearing or capturing).
+        // Ally position reads are vision-gated; a throw can't prove
+        // coverage, so the ally doesn't count as covering.
+        // Readable ally positions are fetched lazily once per scan and
+        // shared across candidate groups — roster reads are vision-gated
+        // host calls, so per-group re-reads would burn fuel for nothing.
+        std::vector<cambc::vec2> readable_allies;
+        bool allies_loaded = false;
+        const auto open_nearby = [&](std::size_t g) {
+            if (!geos[g].gems || dist_to(geos[g], pos) > opportunity_range) return false;
+            if (!allies_loaded)
+            {
+                allies_loaded = true;
+                try
+                {
+                    const auto& allies = turn::roster(cambc::team::ally);
+                    const auto& me = turn::self();
+                    for (std::size_t i = 0; i < allies.size(); ++i)
+                    {
+                        if (allies[i] == me) continue;
+                        readable_allies.push_back(turn::roster_position(cambc::team::ally, i));
+                    }
+                }
+                catch (const cambc::error&) { }
+            }
+            for (const auto& ap : readable_allies)
+                if (dist_to(geos[g], ap) <= 2) return false;
+            return true;
+        };
         // The modulo partition under the route: unrouted leftovers (packs
         // above the solo floor, monolith-adjacent) still have an owner to
         // grind them; without a route this IS the whole job.
         for (std::size_t g = 0; g < geos.size(); ++g)
-            if (mine(static_cast<int>(g))) consider(static_cast<int>(g), -1, relaxed);
+            if (mine(static_cast<int>(g)) || open_nearby(g))
+                consider(static_cast<int>(g), -1, relaxed);
     };
 
     // Grouped opening (issue #38): while the chain has an unfinished stop
