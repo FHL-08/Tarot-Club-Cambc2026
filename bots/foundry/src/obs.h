@@ -64,13 +64,40 @@ struct Obs {
         seen.channel_left = seen.submitting ? enemy.remaining_channel_time() : 0;
         obs.enemies.push_back(seen);
     }
-    const auto groups = cambc::map::camp_groups();
-    for (const auto& group : cambc::vision::camp_groups())
+    // The camp layout is immutable, so the group handles are cached for
+    // the match — map::camp_groups() is a ~27k-fuel host query on the
+    // 42-group map, and vision::camp_groups() re-runs it internally.
+    // camp_group::state() also rebuilds the whole vision board per call,
+    // so filter the cached handles against one visible_tiles() snapshot
+    // and decode lifecycle through the raw imports for in-vision groups.
+    static const auto groups = cambc::map::camp_groups();
+    const auto visible = cambc::vision::visible_tiles();
+    for (std::size_t i = 0; i < groups.size(); ++i)
     {
+        const auto& group = groups[i];
+        bool in_vision = false;
+        for (const auto& member : group)
+            if (visible.is_set(member.spawn_position())) { in_vision = true; break; }
+        if (!in_vision) continue;
         CampObs seen;
-        for (std::size_t i = 0; i < groups.size(); ++i)
-            if (groups[i] == group) seen.group = static_cast<std::uint8_t>(i);
-        seen.state = group.state();
+        seen.group = static_cast<std::uint8_t>(i);
+        std::uint32_t raw = 0;
+        cambc::detail::check(cambc::detail::sdk_camp_group_state(
+            static_cast<std::uint32_t>(static_cast<cambc::handle_camp_group_t>(group)), &raw));
+        switch (raw)
+        {
+        case 1: seen.state = cambc::map::camp_group_alive{}; break;
+        case 2: seen.state = cambc::map::camp_group_reward_available{}; break;
+        case 3:
+        {
+            std::int32_t timer = 0;
+            cambc::detail::check(cambc::detail::sdk_camp_group_cooldown(
+                static_cast<std::uint32_t>(static_cast<cambc::handle_camp_group_t>(group)), &timer));
+            seen.state = cambc::map::camp_group_respawning{ timer };
+            break;
+        }
+        default: throw cambc::error{ cambc::error_code::api_not_in_vision, "camp group state is unknown" };
+        }
         obs.camps.push_back(seen);
     }
     if (const auto frame = wire::read()) obs.wire = *frame;
