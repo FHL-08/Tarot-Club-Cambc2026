@@ -783,6 +783,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             if (!exposed && c.health > 0 && c.strength > 0
                 && pos.chebyshev_distance(c.pos) <= c.attack_range)
                 exposed = true;
+        // An enemy at reach+2 walks in and breaks the 5-round channel:
+        // walking home instead keeps us moving out of its attack line.
+        if (!exposed)
+            for (const auto& e : obs.enemies)
+                if (pos.chebyshev_distance(e.position) <= 5) { exposed = true; break; }
         if (!exposed && mem.recall_attempts < max_recall_retries)
         {
             mem.recall_pending = true;
