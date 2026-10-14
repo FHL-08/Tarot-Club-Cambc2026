@@ -55,7 +55,11 @@ The toolchain (WASI SDK, cmake, ninja) lives in `~/.cache/cambc` — installed b
   run a match; `--statistics` exports final stats JSON. `--rounds N` caps the
   match; `-o` sets the replay dir.
 - `./cambc.exe run-batch` — run a manifest of matches.
-- `./cambc.exe view` — open the latest replay in the visualiser.
+- `tools/viz.sh [replay | platform-match-id | latest | last-platform [map]]` —
+  show a replay to the user. It ALWAYS serves http://127.0.0.1:7026/ and
+  replaces whatever was there, so the user's one tab just needs a reload. Use it
+  instead of `./cambc.exe view`, run it from the main checkout, and never kill
+  cambc processes by name/pattern (skill: `.agents/skills/cambc-visualiser`).
 - `./cambc.exe bundle <bot>` / `submit <bot>` — package / upload a submission.
 - `./cambc.exe maps` — refresh the map pool.
 - `tools/replay/` — decode any replay (platform bundle or `cambc run -o`) into
