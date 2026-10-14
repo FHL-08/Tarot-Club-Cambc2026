@@ -2,6 +2,7 @@
 // in nav.h. Ported from starter-cpp's move_towards_closest, generalized so
 // every goal seeds the field and a false move retries alternative steps.
 #include "nav.h"
+#include "turn.h"
 #include <cstdint>
 
 namespace {
@@ -13,7 +14,7 @@ cambc::bitboard blocked_tiles()
     auto blocked = cambc::map::walls() | cambc::map::holes() | cambc::map::altars()
         | cambc::map::spawn_region(cambc::team::enemy) | cambc::vision::champion_tiles()
         | cambc::vision::camp_tiles() | cambc::vision::teleport_tiles();
-    blocked.set(cambc::self().position(), false);
+    blocked.set(turn::self().position(), false);
     return blocked;
 }
 
@@ -28,7 +29,7 @@ namespace nav {
 
 bool step(const cambc::bitboard& goals)
 {
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     // Callers mask goals with ~blocked, and blocked clears self — so our own
     // tile sneaks back into the goal set. Drop it: a "goal" that is our own
     // position must not veto every descent step toward the remaining goals.
@@ -37,7 +38,10 @@ bool step(const cambc::bitboard& goals)
     if (!me.can_move() || goals_clean.is_empty())
         return false;
 
-    const auto blocked = blocked_tiles();
+    // The first mask reuses the turn cache — identical to a fresh build
+    // this turn. Only the retry re-queries stay live: a revealed occupant
+    // must enter the mask (comment below).
+    const auto blocked = turn::blocked_tiles();
 
     // BFS out from the goals until our tile is reached; goal tiles are
     // lifted out of the walls so occupied ones still seed the descent.
@@ -69,7 +73,10 @@ bool step(const cambc::bitboard& goals)
         try
         {
             if (me.move_absolute(best))
+            {
+                turn::note_moved();
                 return true;
+            }
         }
         catch (const cambc::error&) { }
         // The reveal may be a mid-path blocker, not the destination —

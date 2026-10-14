@@ -90,7 +90,7 @@ std::optional<exec::Action> tactic::deny(const Obs& obs)
     if (const CampObs* c = tactic::seen_camp(obs, here); c && reward_pending(*c))
         on_reward = true;
 
-    const cambc::bitboard ally_tiles = cambc::vision::champion_tiles(cambc::team::ally);
+    const cambc::bitboard& ally_tiles = turn::champion_tiles(cambc::team::ally);
     for (const auto& c : obs.camps)
     {
         if (!reward_pending(c)) continue;

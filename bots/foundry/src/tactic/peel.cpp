@@ -40,23 +40,24 @@ struct Interrupts {
 Interrupts interrupts()
 {
     Interrupts kit;
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     kit.primed = me.buffs().has_enhanced_attack();
     kit.lock = me.consumables()[cambc::consumable_type::altar_lock].count() > 0;
-    if (!me.can_cast()) return kit;
-    const auto abilities = me.abilities(); // copy of the slot views — binds live owner handles
+    if (!turn::self_state().contains(cambc::champion_state::can_cast)) return kit;
+    const auto& abilities = turn::abilities();
     for (std::uint32_t s = 0; s < 2; ++s)
     {
         const auto& ab = abilities[s];
-        if (!ab.info() || !ab.is_ready()) continue;
+        if (!ab.info() || !turn::slot_ready(s)) continue;
         if (ab.is_cc())
         {
             kit.cc_slot = static_cast<int>(s);
             kit.cc_range = ab.get<cambc::ability_cc>().range;
-            kit.cc_ground = ab.can_target_ground() && !ab.can_target_enemies();
+            kit.cc_ground = turn::slot_targets(s).contains(cambc::ability_target_mask::ground)
+                && !turn::slot_targets(s).contains(cambc::ability_target_mask::enemies);
         }
         else if (ab.is_attack_reset() && ab.get<cambc::ability_attack_reset>().enhanced_attack
-                 && ab.can_target_self())
+                 && turn::slot_targets(s).contains(cambc::ability_target_mask::self))
         {
             kit.prime_slot = static_cast<int>(s);
         }
@@ -69,7 +70,7 @@ Interrupts interrupts()
 std::optional<exec::Action> tactic::peel(const Obs& obs)
 {
     if (obs.enemies.empty()) return std::nullopt;
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
 
     std::vector<ChannelTarget> targets;
     for (const auto& e : obs.enemies)
@@ -86,13 +87,11 @@ std::optional<exec::Action> tactic::peel(const Obs& obs)
         {
             // Obs snapshots tribute only — recall state is a live query on
             // the visible handle; a stale tile is simply skipped.
-            try
-            {
-                const auto enemy = cambc::vision::champion_at(e.position);
-                if (!enemy.is_recalling()) continue;
-                t.left = enemy.remaining_channel_time();
-            }
-            catch (const cambc::error&) { continue; }
+            const auto recalling = turn::enemy_recalling(e.position);
+            if (!recalling || !*recalling) continue;
+            const auto left = turn::enemy_channel_left(e.position);
+            if (!left) continue;
+            t.left = *left;
         }
         t.score = static_cast<std::int64_t>(t.left) * t.gems;
         targets.push_back(t);
@@ -104,7 +103,7 @@ std::optional<exec::Action> tactic::peel(const Obs& obs)
     });
 
     const Interrupts kit = interrupts();
-    const cambc::bitboard attack_tiles = me.can_attack() ? me.attack_tiles() : cambc::bitboard{};
+    const cambc::bitboard attack_tiles = turn::self_state().contains(cambc::champion_state::can_attack) ? turn::attack_tiles() : cambc::bitboard{};
 
     for (const auto& t : targets)
     {
@@ -143,7 +142,7 @@ std::optional<exec::Action> tactic::peel(const Obs& obs)
             {
                 if (t.pos.chebyshev_distance(altar) > cambc::constants::submit_gems_range
                     || obs.self_pos.chebyshev_distance(altar) > 2
-                    || cambc::vision::has_altar_lock(altar))
+                    || turn::altar_locked(altar))
                     continue;
                 std::cout << "TACTIC peel: cancelled tribute @r" << obs.round << '\n';
                 return exec::UseItem{ cambc::consumable_type::altar_lock, altar };

@@ -69,4 +69,9 @@ using Action = std::variant<Move, Attack, Cast, Channel, Buy, UseItem, Wait>;
 // stale target, a move with no improving step, or a plain Wait.
 bool apply(const Action& action);
 
+// Builds the match-static caches (opening stops, tactic geography) one at a
+// time, only while a turn still has headroom — pure map/draft data, so no
+// decision input changes; it just keeps the first-use spike off a full turn.
+void warm_statics();
+
 } // namespace exec

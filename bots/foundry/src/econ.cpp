@@ -8,6 +8,7 @@
 // shard_count + combine_count * emblem_count >= combine_count.
 #include <cambc.h>
 #include "econ.h"
+#include "turn.h"
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
@@ -83,7 +84,7 @@ std::uint32_t entry_progress(item_type shard, const cambc::enum_map<item_type>& 
 std::uint32_t walk_to_altar(cambc::vec2 from)
 {
     std::int64_t best = std::numeric_limits<std::int64_t>::max();
-    for (const auto& altar : cambc::map::altars().positions())
+    for (const auto& altar : turn::altars())
         best = std::min(best, from.chebyshev_distance(altar));
     if (best == std::numeric_limits<std::int64_t>::max()) return 0;
     return static_cast<std::uint32_t>(
@@ -97,8 +98,8 @@ std::uint32_t walk_to_altar(cambc::vec2 from)
 std::uint32_t bag_cap(const Obs& obs)
 {
     std::int64_t cap = 10 + static_cast<std::int64_t>(obs.round) / 60;
-    const auto ours = cambc::global_submitted_gems(cambc::team::ally);
-    const auto theirs = cambc::global_submitted_gems(cambc::team::enemy);
+    const auto ours = turn::submitted_gems(cambc::team::ally);
+    const auto theirs = turn::submitted_gems(cambc::team::enemy);
     if (theirs > ours)
         cap -= std::min<std::int64_t>(10, static_cast<std::int64_t>(theirs - ours) / 25);
     return static_cast<std::uint32_t>(std::clamp<std::int64_t>(cap, 10, 40));
@@ -109,7 +110,7 @@ std::uint32_t bag_cap(const Obs& obs)
 std::int64_t dist_to_spawn(cambc::vec2 p, cambc::team side)
 {
     std::int64_t best = std::numeric_limits<std::int64_t>::max();
-    for (const auto tile : cambc::map::spawn_region(side).positions())
+    for (const auto tile : turn::spawn_region(side).positions())
         best = std::min(best, p.chebyshev_distance(tile));
     return best;
 }
@@ -133,18 +134,18 @@ bool route_stocks_consumables()
         {
             const Plan plan = Plan::decode(cambc::draft_memory);
             const auto allies = cambc::champions(cambc::team::ally);
-            const auto& me = cambc::self();
+            const auto& me = turn::self();
             std::size_t slot = allies.size();
             for (std::size_t i = 0; i < allies.size(); ++i)
                 if (allies[i] == me) { slot = i; break; }
             if (slot >= plan.num_slots()) return false;
             const Route route = plan.route_at(static_cast<std::uint8_t>(slot));
-            const auto altars = cambc::map::altars().positions();
+            const auto& altars = turn::altars();
             const auto enemy_side = [&](cambc::vec2 altar) {
                 return dist_to_spawn(altar, cambc::team::enemy)
                     < dist_to_spawn(altar, cambc::team::ally);
             };
-            const auto groups = cambc::map::camp_groups();
+            const auto& groups = turn::map_groups();
             for (std::uint8_t i = 0; i < route.size(); ++i)
             {
                 const Stop stop = route[i];
@@ -173,9 +174,22 @@ bool route_stocks_consumables()
 
 } // namespace
 
+// The route probe is pure plan+map data (~30-40k on the big maps): let
+// exec::warm_statics spend a slack turn on it instead of the first
+// gold-carrying field turn.
+void econ::warm()
+{
+    (void)route_stocks_consumables();
+}
+
 void econ::maybe_buy(Role role, const Obs& obs)
 {
-    auto& me = cambc::self();
+    auto& me = turn::self();
+    // Every purchase below is gated on can_buy(), which needs gold — with an
+    // empty purse the whole body is a no-op, so skip its one-time statics
+    // (route probe, queue reads) instead of spending ~40k on a field turn.
+    // obs.self_gold was read this same turn; gold cannot move until a buy.
+    if (obs.self_gold == 0) return;
     const auto queue = queue_for(me.champion_name());
     const auto items = me.item_count();
 
