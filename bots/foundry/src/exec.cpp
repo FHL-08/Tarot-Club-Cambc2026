@@ -48,6 +48,18 @@ const char* state_name(State s)
     return "?";
 }
 
+// A route/haul move whose nav::step fails this many turns running means
+// the goal is pocketed behind walls/holes or a permanently sealed ring —
+// blacklist the group for a cooldown so the route falls through to the
+// next-best stop instead of starving on an unreachable target.
+constexpr int nav_fail_limit = 6;
+constexpr std::uint32_t nav_cooldown = 40;
+
+// Recalls cancelled this many times in a row mean an attacker keeps
+// interrupting the channel while staying out of vision — 'exposed' can't
+// see it, so the only safe exit left is walking home.
+constexpr int max_recall_retries = 3;
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -59,6 +71,12 @@ struct Mem {
     int stand_group = -1;
     std::int32_t stand_since = -1;
     bool overrun_logged = false;
+    int nav_pending = -1; // route/haul group the emitted Move steers to
+    int nav_fail_group = -1;
+    int nav_fail_count = 0;
+    std::vector<std::uint32_t> unreachable_until; // per-group blacklist expiry
+    int recall_attempts = 0;
+    bool recall_pending = false; // recall issued, outcome not yet observed
 };
 Mem mem;
 
@@ -135,6 +153,12 @@ const CampObs* seen(const Obs& obs, int g)
     return nullptr;
 }
 
+bool unreachable(int g, std::uint32_t round)
+{
+    return g < static_cast<int>(mem.unreachable_until.size())
+        && mem.unreachable_until[static_cast<std::size_t>(g)] > round;
+}
+
 // Identical legality mask to nav.cpp's blocked_tiles — goal seeds must be
 // masked with it because an occupied goal tile would still seed the descent.
 cambc::bitboard blocked_tiles()
@@ -169,14 +193,17 @@ bool enemy_on(int g, const Obs& obs)
 std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     int only_group = -1, bool harmless_only = false)
 {
-    bool dangerous[64] = {};
+    std::vector<char> dangerous;
     if (harmless_only)
+    {
+        dangerous.assign(groups().size(), 0);
         for (const auto& c : cambc::vision::camps())
             if (c.health() > 0 && c.strength() > 0)
             {
                 const int g = group_of(c.spawn_position());
-                if (g >= 0) dangerous[g] = true;
+                if (g >= 0) dangerous[static_cast<std::size_t>(g)] = 1;
             }
+    }
     bool found = false;
     cambc::vec2 best{};
     float best_health = 0;
@@ -184,7 +211,8 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     {
         if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
         const int g = group_of(c.spawn_position());
-        if (g < 0 || (only_group >= 0 && g != only_group) || (only_group < 0 && !mine(g)) || dangerous[g])
+        if (g < 0 || (only_group >= 0 && g != only_group) || (only_group < 0 && !mine(g))
+            || (!dangerous.empty() && dangerous[static_cast<std::size_t>(g)]))
             continue;
         const auto p = c.position();
         if (!found || c.health() < best_health
@@ -218,6 +246,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     using cs = cambc::champion_state;
     const auto st = obs.self_state;
 
+    my_slot(); // before any done() — the transition log prints the real slot
+    mem.nav_pending = -1;
+
     // Mid-channel turns can't act — tribute/recall/teleport continue alone.
     if (st.contains(cs::submitting_gems) || st.contains(cs::recalling) || st.contains(cs::teleporting)
         || (!st.contains(cs::can_move) && !st.contains(cs::can_attack)))
@@ -226,10 +257,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     if (const auto offer = tactic::offer(obs))
         return done(State::tactic, *offer, obs);
 
-    my_slot();
     const auto& geos = groups();
     const cambc::vec2 pos = obs.self_pos;
     const int here = group_of(pos);
+    const bool at_spawn = cambc::map::spawn_region(cambc::team::ally).is_set(pos);
 
     // Lethal-threat proxy: a visible enemy champion inside maximum attack
     // reach (3). Enemy camps aren't observable here, so plain low-HP stays
@@ -240,6 +271,16 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
     const bool dying = obs.self_health < obs.self_max_health * 0.45f;
     const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
+
+    // A recall we emitted that never shows in champion_state was cancelled
+    // by damage/stun between turns; a completed one lands on spawn.
+    if (mem.recall_pending)
+    {
+        mem.recall_pending = false;
+        if (at_spawn) mem.recall_attempts = 0;
+        else ++mem.recall_attempts;
+    }
+    if (!unsafe) mem.recall_attempts = 0; // threat gone — retry freely next time
 
     // Standing on own group's reward tiles: an uncontested stay completes
     // the capture (passive — free hit meanwhile), a contested one holds
@@ -292,7 +333,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // Pitstop: badly hurt, or hurt with an enemy in reach. Damage
     // interrupts recall (GameRules §Channels), so while a live attacker
     // can still reach us we walk home — out of range the channel is safe.
-    const bool at_spawn = cambc::map::spawn_region(cambc::team::ally).is_set(pos);
+    // 'exposed' only sees visible attackers; a bush-hidden one still breaks
+    // the channel every turn, so after max_recall_retries cancels we walk.
     if (unsafe || (mem.state == State::pitstop && at_spawn && obs.self_health < obs.self_max_health * 0.9f))
     {
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
@@ -301,10 +343,15 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             if (!exposed && c.health() > 0 && c.strength() > 0
                 && pos.chebyshev_distance(c.position()) <= c.attack_range())
                 exposed = true;
-        if (exposed)
-            return done(State::pitstop, Move{ cambc::map::spawn_region(cambc::team::ally) }, obs);
-        return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
+        if (!exposed && mem.recall_attempts < max_recall_retries)
+        {
+            mem.recall_pending = true;
+            return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
+        }
+        return done(State::pitstop, Move{ cambc::map::spawn_region(cambc::team::ally) }, obs);
     }
+
+    const auto blocked = blocked_tiles();
 
     // Bank once the bag crosses the econ cap or the deadline forces it.
     if (econ::should_tribute(obs))
@@ -320,20 +367,21 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         if (nearest_d <= cambc::constants::submit_gems_range)
             return done(State::bank, Channel{ Channel::Kind::tribute, nearest }, obs);
-        rings &= ~blocked_tiles();
+        rings &= ~blocked;
         if (!rings.is_empty()) // every approach tile occupied: bank later
             return done(State::bank, Move{ std::move(rings) }, obs);
     }
 
     // Route step: greedy nearest-ready over the partition; a confirmed
     // reward outranks a believed-live camp at any distance.
-    const auto blocked = blocked_tiles();
     int target = -1;
     bool target_reward = false;
     std::int64_t target_cost = 0;
     for (std::size_t g = 0; g < geos.size(); ++g)
     {
-        if (!mine(static_cast<int>(g)) || geos[g].monolith) continue;
+        if (!mine(static_cast<int>(g)) || geos[g].monolith
+            || unreachable(static_cast<int>(g), obs.round))
+            continue;
         const CampObs* c = seen(obs, static_cast<int>(g));
         bool reward = false;
         std::int64_t cost;
@@ -365,6 +413,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (c && std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
         {
             auto free_tiles = geos[target].tiles & ~blocked;
+            mem.nav_pending = target;
             return done(State::travel, Move{ std::move(free_tiles) }, obs);
         }
         // Alive (or believed): hit the target already in range — focused
@@ -381,6 +430,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         goals &= ~blocked;
         if (goals.is_empty()) goals = geos[target].tiles & ~blocked; // rings sealed off: walk onto the tiles
         if (goals.is_empty()) goals = geos[target].tiles;
+        mem.nav_pending = target;
         return done(State::travel, Move{ std::move(goals) }, obs);
     }
 
@@ -391,7 +441,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     std::int64_t haul_dist = 0;
     for (std::size_t g = 0; g < geos.size(); ++g)
     {
-        if (!mine(static_cast<int>(g)) || geos[g].monolith) continue;
+        if (!mine(static_cast<int>(g)) || geos[g].monolith
+            || unreachable(static_cast<int>(g), obs.round))
+            continue;
         const std::int32_t ready = ledger::ready_round(static_cast<int>(g));
         if (ready == ledger::never) continue;
         const auto d = dist_to(geos[g], pos);
@@ -408,7 +460,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         for (const auto tile : geos[haul].tile_list) ring.draw_chebyshev(tile, 1);
         ring &= ~geos[haul].tiles & ~blocked;
         if (!ring.is_set(pos) && !ring.is_empty())
+        {
+            mem.nav_pending = haul;
             return done(State::haul, Move{ std::move(ring) }, obs);
+        }
         return done(State::haul, Wait{}, obs);
     }
 
@@ -423,14 +478,17 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     }
 
     // L1: an idle turn while an owned live uncontested camp exists is a
-    // machine violation — flag it rather than hide it.
+    // machine violation — flag it rather than hide it. Uncontested can only
+    // be proven by vision: an unseen group may be enemy-held, so a ledger
+    // belief alone never flags. Unreachable groups are legitimately idle.
     for (std::size_t g = 0; g < geos.size(); ++g)
     {
-        if (!mine(static_cast<int>(g))) continue;
+        if (!mine(static_cast<int>(g)) || geos[g].monolith
+            || unreachable(static_cast<int>(g), obs.round))
+            continue;
         const CampObs* c = seen(obs, static_cast<int>(g));
-        const bool live = (c && std::holds_alternative<cambc::map::camp_group_alive>(c->state))
-            || (!c && ledger::ready_round(static_cast<int>(g)) <= static_cast<int>(obs.round));
-        if (live && !(c && enemy_on(static_cast<int>(g), obs)))
+        if (c && std::holds_alternative<cambc::map::camp_group_alive>(c->state)
+            && !enemy_on(static_cast<int>(g), obs))
         {
             std::cout << "FSM_L1 idle-work g" << g << " r" << obs.round << '\n';
             break;
@@ -448,7 +506,38 @@ bool exec::apply(const Action& action)
             using T = std::decay_t<decltype(a)>;
             if constexpr (std::is_same_v<T, Move>)
             {
-                return nav::step(a.goals);
+                const bool moved = nav::step(a.goals);
+                // A route/haul Move that can't descend at all means the
+                // goal is unreachable from here — nav_fail_limit turns in
+                // a row blacklists the group for nav_cooldown rounds so the
+                // route falls through to the next-best stop.
+                if (mem.nav_pending >= 0)
+                {
+                    if (moved)
+                    {
+                        mem.nav_fail_group = -1;
+                        mem.nav_fail_count = 0;
+                    }
+                    else if (mem.nav_fail_group == mem.nav_pending)
+                    {
+                        ++mem.nav_fail_count;
+                    }
+                    else
+                    {
+                        mem.nav_fail_group = mem.nav_pending;
+                        mem.nav_fail_count = 1;
+                    }
+                    if (mem.nav_fail_count >= nav_fail_limit)
+                    {
+                        if (mem.unreachable_until.size() != groups().size())
+                            mem.unreachable_until.assign(groups().size(), 0);
+                        mem.unreachable_until[static_cast<std::size_t>(mem.nav_pending)]
+                            = cambc::round_number() + nav_cooldown;
+                        mem.nav_fail_group = -1;
+                        mem.nav_fail_count = 0;
+                    }
+                }
+                return moved;
             }
             else if constexpr (std::is_same_v<T, Attack>)
             {
@@ -495,7 +584,13 @@ bool exec::apply(const Action& action)
             }
             else if constexpr (std::is_same_v<T, Channel>)
             {
-                if (a.kind == Channel::Kind::recall) { me.recall(); return true; }
+                if (a.kind == Channel::Kind::recall)
+                {
+                    // Stunned or dead between tick and apply: a thrown
+                    // error would fault the turn, a false just skips it.
+                    try { me.recall(); return true; }
+                    catch (const cambc::error&) { return false; }
+                }
                 me.submit_gems(a.altar);
                 return true;
             }
