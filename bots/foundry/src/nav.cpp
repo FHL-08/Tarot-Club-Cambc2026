@@ -29,7 +29,12 @@ namespace nav {
 bool step(const cambc::bitboard& goals)
 {
     const auto& me = cambc::self();
-    if (!me.can_move() || goals.is_empty() || goals.is_set(me.position()))
+    // Callers mask goals with ~blocked, and blocked clears self — so our own
+    // tile sneaks back into the goal set. Drop it: a "goal" that is our own
+    // position must not veto every descent step toward the remaining goals.
+    auto goals_clean = goals;
+    goals_clean.set(me.position(), false);
+    if (!me.can_move() || goals_clean.is_empty())
         return false;
 
     const auto blocked = blocked_tiles();
@@ -40,7 +45,7 @@ bool step(const cambc::bitboard& goals)
     self_tile.set(me.position());
     cambc::distance_field field;
     cambc::bitboard visited;
-    field.compute_to(blocked & ~goals, goals, self_tile, visited);
+    field.compute_to(blocked & ~goals_clean, goals_clean, self_tile, visited);
 
     const auto speed = static_cast<std::uint16_t>(me.base_stats().base_move_speed);
     auto closed = blocked;
@@ -56,8 +61,17 @@ bool step(const cambc::bitboard& goals)
             }
         if (best == me.position())
             return false;
-        if (me.move_absolute(best))
-            return true;
+        // A false return means a hidden occupant — legal, retryable. A
+        // thrown error means the destination was known-illegal all along:
+        // the hand-built mask misses an occupant class the engine counts
+        // (seen as error 22 in lanes). Either way mark the tile and retry
+        // alternatives — the alternative is faulting the whole turn.
+        try
+        {
+            if (me.move_absolute(best))
+                return true;
+        }
+        catch (const cambc::error&) { }
         // The reveal may be a mid-path blocker, not the destination —
         // re-query vision so every newly seen occupant enters the mask.
         closed.set(best);
