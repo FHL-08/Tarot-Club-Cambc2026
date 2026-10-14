@@ -34,6 +34,7 @@ Role role_of(cambc::champion_type type)
     case cambc::champion_type::vendetta: return Role::FARMER;
     case cambc::champion_type::cassi:
     case cambc::champion_type::tavi:
+    case cambc::champion_type::stellar:
     case cambc::champion_type::vesper_vale: return Role::CARRY;
     case cambc::champion_type::issac: return Role::ESCORT;
     default: return Role::FLEX;

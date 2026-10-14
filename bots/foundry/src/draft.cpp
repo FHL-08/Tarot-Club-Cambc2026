@@ -20,17 +20,17 @@ namespace {
 // roster's needs; counter-drafting stays a tactic concern. Entries past the
 // named five exist only so every enum has a place if a pick was forced.
 constexpr cambc::champion_draft pick_order[] = {
-    cambc::champion_draft::vendetta,
     cambc::champion_draft::cassi_and_issac,
     cambc::champion_draft::varg,
-    cambc::champion_draft::tavi,
-    cambc::champion_draft::vesper_vale,
-    cambc::champion_draft::marcella,
     cambc::champion_draft::stellar,
+    cambc::champion_draft::vendetta,
+    cambc::champion_draft::tavi,
     cambc::champion_draft::ren,
-    cambc::champion_draft::prism,
     cambc::champion_draft::ryth,
+    cambc::champion_draft::marcella,
     cambc::champion_draft::willow,
+    cambc::champion_draft::prism,
+    cambc::champion_draft::vesper_vale,
 };
 
 // One pick → its champion bodies, in the order the engine lists them in the
