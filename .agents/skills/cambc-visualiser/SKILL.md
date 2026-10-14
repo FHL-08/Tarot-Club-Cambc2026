@@ -29,5 +29,9 @@ open, give them that URL (or the `browser_preview` of `http://127.0.0.1:7026`).
   it. Either way the user ends up on Firefox's "Unable to connect" page.
 - `viz.sh` refuses to touch port 7026 when anything other than `cambc.exe view`
   holds it. Report that to the user; don't force it.
-- `BROWSER=true tools/viz.sh …` suppresses cambc's attempt to open a new browser
-  tab (useful when the user already has the tab open).
+- `viz.sh` opens exactly one tab on the live URL once the server answers.
+  `VIZ_NO_BROWSER=1 tools/viz.sh …` skips that (e.g. for your own checks).
+- Never start `cambc.exe view` yourself, not even for a quick probe or on a
+  scratch port. It auto-opens a tab in the user's Firefox on every start, and
+  when your throwaway server stops, that tab becomes an "Unable to connect" page.
+  If you truly need a scratch server, prefix it with `BROWSER=true`.

@@ -11,7 +11,9 @@ replay="${1:?usage: assets.sh <replay.repl26a>}"
 port="${CAMBC_VIEW_PORT:-7099}"
 mkdir -p "$cache"
 
-"$root/cambc.exe" view --port "$port" "$replay" >"$cache/view.log" 2>&1 &
+# BROWSER=true: cambc view opens a browser tab on start, and this server dies
+# seconds later — an auto-opened tab here is a dead "Unable to connect" tab.
+BROWSER=true "$root/cambc.exe" view --port "$port" "$replay" >"$cache/view.log" 2>&1 &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:$port/" -o "$cache/index.html" && break; sleep 0.25; done
