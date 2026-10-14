@@ -1,10 +1,8 @@
-// Spending policy: role build queues, consumable top-up, tribute bag-cap.
-// docs/strategy.md §Champion-build queues mapped onto plan.h roles:
-//   FARMER <- Vendetta line (camp-kill cycler)
-//   CARRY  <- Tavi line (field-hauler; the sell/swap at ~r1600 is the
-//             role-gated Tavi path, deferred until a Tavi role exists)
-//   ESCORT <- Issac line (meat-shield on capture tiles)
-//   FLEX   <- Varg line (fallback for slots beyond the plan's role table)
+// Spending policy: per-champion build queues, consumable top-up, tribute
+// bag-cap. The queue is keyed on the champion's own champion_type, not the
+// slot's plan Role — platform evidence (issue #34) shows top teams stack
+// ~60–68% of shards into Power in the champion's scaling stat, so each
+// line leads with its primary power shard and ends on it open-ended.
 // Queues list SHARDS — five (six for Power) matching shards auto-combine
 // into the emblem, so the queue entry is done when
 // shard_count + combine_count * emblem_count >= combine_count.
@@ -21,25 +19,24 @@ namespace {
 using cambc::consumable_type;
 using cambc::item_type;
 
-constexpr item_type farmer_queue[]{
-    item_type::monster_shard_of_strength,
-    item_type::jungle_shard_of_strength,
+// The last entry is the open-ended tail — it must be the primary power
+// shard so finished queues keep stacking the scaling stat.
+constexpr item_type str_hp_str[]{
+    item_type::power_shard_of_strength,
+    item_type::power_shard_of_health,
     item_type::power_shard_of_strength,
 };
-constexpr item_type carry_queue[]{
-    item_type::jungle_shard_of_strength,
-    item_type::treasure_shard_of_strength,
-    item_type::monster_shard_of_strength,
+constexpr item_type foc_hp_foc[]{
+    item_type::power_shard_of_focus,
+    item_type::durability_shard_of_health,
     item_type::power_shard_of_focus,
 };
-constexpr item_type escort_queue[]{
-    item_type::jungle_shard_of_health,
-    item_type::durability_shard_of_health,
-    item_type::power_shard_of_health,
+constexpr item_type foc_str_foc[]{
+    item_type::power_shard_of_focus,
+    item_type::power_shard_of_strength,
+    item_type::power_shard_of_focus,
 };
-constexpr item_type flex_queue[]{
-    item_type::jungle_shard_of_strength,
-    item_type::monster_shard_of_strength,
+constexpr item_type str_only[]{
     item_type::power_shard_of_strength,
 };
 
@@ -48,16 +45,30 @@ constexpr item_type flex_queue[]{
 // whittling a pack adjacent to its capture tiles.
 constexpr std::int64_t lock_pass_range = 3;
 
-std::span<const item_type> queue_for(Role role)
+std::span<const item_type> queue_for(cambc::champion_type champ)
 {
-    switch (role)
+    using cambc::champion_type;
+    switch (champ)
     {
-    case Role::FARMER: return farmer_queue;
-    case Role::CARRY: return carry_queue;
-    case Role::ESCORT: return escort_queue;
-    case Role::FLEX: return flex_queue;
+    case champion_type::varg:
+    case champion_type::vendetta:
+    case champion_type::marcella:
+    case champion_type::issac:
+    case champion_type::vesper_vale:
+        return str_hp_str;
+    case champion_type::cassi:
+    case champion_type::stellar:
+    case champion_type::prism:
+        return foc_hp_foc;
+    case champion_type::tavi:
+        return foc_str_foc;
+    case champion_type::ryth:
+    case champion_type::ren:
+        return str_hp_str;
+    case champion_type::willow:
+        return str_only;
     }
-    return flex_queue;
+    return str_hp_str;
 }
 
 // Shards banked toward an entry, counting emblems at their combine cost.
@@ -165,7 +176,7 @@ bool route_stocks_consumables()
 void econ::maybe_buy(Role role, const Obs& obs)
 {
     auto& me = cambc::self();
-    const auto queue = queue_for(role);
+    const auto queue = queue_for(me.champion_name());
     const auto items = me.item_count();
 
     // Consumables first on routed bodies: forward routes only see the shop

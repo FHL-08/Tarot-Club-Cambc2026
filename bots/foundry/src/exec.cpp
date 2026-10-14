@@ -57,6 +57,13 @@ constexpr std::uint32_t strike_cooldown = 200;
 // lands its last hit already past the bail line.
 constexpr float retreat_floor = 0.40f;
 
+// Shop trip: enough gold for a full Power emblem (6 shards × 30g) sends an
+// unthreatened, light-bagged champion home to spend — routes otherwise
+// never revisit spawn except on low HP, leaving hundreds banked (#34).
+// Tavi shops in the field (GameRules: Tavi buys shards anywhere), so it
+// never takes the trip.
+constexpr std::uint32_t shop_trip_gold = 180;
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -571,13 +578,23 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const bool recovered = mem.state != State::pitstop
         || (at_spawn ? obs.self_health >= heal_target
                      : obs.self_health >= obs.self_max_health * 0.75f);
-    if (unsafe || !recovered)
+    // Shop trips reuse the pitstop's recall-or-walk-home arm but are not
+    // retreats: !threat keeps them out of the sortie watchdog, and they
+    // leave fled_group unset so the heal target stays champion-priced.
+    // A healthy shopper at spawn is already `recovered`, so the Wait never
+    // holds it; recall lands at turn start and bot.cpp's econ::maybe_buy
+    // spends the gold before exec runs — next turn gold < the threshold
+    // and the trip ends on its own.
+    const bool shop_trip = !threat && !at_spawn
+        && obs.self_gold >= shop_trip_gold && obs.self_gems <= 10
+        && cambc::self().champion_name() != cambc::champion_type::tavi;
+    if (unsafe || !recovered || shop_trip)
     {
         // fled_group prices the heal target against the pack that dealt
         // the damage — the group we're standing in, not the route
         // destination. Off the tiles (ranged ring, mid-commute) the active
         // target stays the better guess.
-        if (mem.state != State::pitstop)
+        if (mem.state != State::pitstop && !shop_trip)
             mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
                 && !threat ? (here >= 0 ? here : mem.active_target) : -1;
         // Sortie watchdog: contested exits only — an attrition bail is
