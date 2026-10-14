@@ -43,6 +43,20 @@ constexpr std::uint32_t nav_cooldown = 40;
 // see it, so the only safe exit left is walking home.
 constexpr int max_recall_retries = 3;
 
+// A pitstop entry that abandons a live-camp target is a failed sortie;
+// strike_limit in a row on one group means contested churn the static
+// fitness gate can't price (a pack camped inside the enemy zerg), so the
+// group joins the unreachable blacklist for a long cooldown.
+constexpr int strike_limit = 3;
+constexpr std::uint32_t strike_cooldown = 200;
+
+// Retreat floor: the share of max hp that ends a sortie — the `dying`
+// pitstop trigger and the heal-to-need release both price off it. A
+// release reserve below it would discharge a body the dying check
+// re-traps the very next turn, and a sortie budgeted to a lower floor
+// lands its last hit already past the bail line.
+constexpr float retreat_floor = 0.40f;
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -54,6 +68,19 @@ struct Mem {
     int nav_pending = -1; // route/haul group the emitted Move steers to
     int nav_fail_count = 0;
     std::vector<std::uint32_t> unreachable_until; // per-group blacklist expiry
+    std::vector<std::uint8_t> strikes;            // consecutive failed sorties per group
+    int fled_group = -1;                          // camp the current pitstop fled; -1 = champion-driven
+    // Last live read on a group's remaining hp/dps — the heal-to-need
+    // input; hp < 0 means never seen alive this match.
+    struct CampLeft { float hp = -1.0f, dps = 0.0f; std::int32_t round = -1; };
+    std::vector<CampLeft> camp_left;
+    // Cast-fizzle watchdog: a use() that throws never starts the cooldown,
+    // so `is_ready` stays true and the naive loop would re-emit the same
+    // fizzling cast every turn. Three consecutive strikes retire the slot.
+    int last_cast_slot = -1;
+    std::uint32_t last_cast_round = 0;
+    std::uint8_t cast_strikes[2] = { 0, 0 };
+    bool cast_banned[2] = { false, false };
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
@@ -75,12 +102,19 @@ struct GroupGeo {
     std::vector<cambc::vec2> tile_list;
     bool monolith = false; // 20k hp at 200 dmg — a planner decision (#8), not a stub stop
     std::uint32_t gems = 0;  // 0 = pure gold camp: fallback work only, never displaces a real capture
+    float health = 0;        // Σ member base health — clear-time input to the kit-fitness gate
+    float dps = 0;           // Σ member base strength per awake turn — the gate's retaliation input
+    bool passive = true;     // no member fights back (clusters): retaliation is zero, always fittable
 };
 
 // Camp layouts are immutable — the host layout query runs once.
 const std::vector<GroupGeo>& groups()
 {
     static const std::vector<GroupGeo> cache = [] {
+        // base_stats() prices like any host call but is a pure function of
+        // camp_type — one cached lookup per kind covers every member on the
+        // map (same dodge as atlas.cpp's design cache).
+        std::array<std::optional<cambc::camp_stats>, 16> designs;
         std::vector<GroupGeo> out;
         for (const auto& group : cambc::map::camp_groups())
         {
@@ -88,7 +122,14 @@ const std::vector<GroupGeo>& groups()
             group.spawn_tiles_into(geo.tiles);
             geo.tile_list = geo.tiles.positions();
             for (const auto& member : group)
+            {
                 geo.monolith = geo.monolith || member.is_monolith();
+                const auto type = static_cast<std::size_t>(member.kind());
+                if (!designs[type]) designs[type] = member.base_stats();
+                geo.health += designs[type]->base_health;
+                geo.dps += designs[type]->base_strength;
+                geo.passive = geo.passive && designs[type]->base_strength <= 0;
+            }
             geo.gems = group.gem_value();
             out.push_back(std::move(geo));
         }
@@ -158,6 +199,41 @@ bool mine(int g)
     return false;
 }
 
+// Sustained camp damage per turn for this body — the same estimate the
+// planner prices routes with (planner.cpp kit_for): basic output plus one
+// camp-damage ability amortised over the 8-turn slot cooldown, a ranged
+// kit's nuke worth ~2x focus, a melee payload one extra basic. The burst
+// term needs a materialised damage slot — attack_reset/heal kits (Vesper
+// Vale, Willow) have zero castable camp damage, and camp_cast never emits
+// those kinds. Design stats are fixed per champion, so the host lookup
+// runs once.
+float my_dps()
+{
+    static const float dps = [] {
+        const auto& me = cambc::self();
+        const auto stats = me.base_stats();
+        const float basic = stats.base_strength * stats.camp_damage_multiplier;
+        float burst = 0;
+        for (const auto& ab : me.abilities())
+            if (ab.is_damage() || ab.is_aoe_damage())
+                burst = stats.base_attack_range > 1 ? 2.0f * stats.base_focus : basic;
+        return basic + burst / 8.0f;
+    }();
+    return dps;
+}
+
+// The planner's per-kit solo check at runtime (planner.cpp:256-258 mirror):
+// pack retaliation across one full clear is site.dps × turns-to-clear, and
+// a camp that burns ≥2 health bars is a trap — the sortie loop leaves the
+// body dead or commuting, never collecting (lanes: every elk is unrouted
+// for exactly this, yet the modulo partition re-dealt one to each slot).
+// Passive groups deal no damage and pass by definition.
+bool unfit(const GroupGeo& g, float my_max_health)
+{
+    return !g.passive
+        && g.dps * std::max(1.0f, g.health / my_dps()) >= my_max_health * 2.0f;
+}
+
 const CampObs* seen(const Obs& obs, int g)
 {
     for (const auto& c : obs.camps)
@@ -204,6 +280,39 @@ bool enemy_on(int g, const Obs& obs)
 // harmless_only restricts that free hit to groups with no live attacker:
 // damage wakes the whole group, so poking a wolf mid-capture buys 5
 // rounds of retaliation while standing still.
+// vision::camps() resolves every occupancy-mask tile through camp_at(),
+// and the occupancy mask can still list a camp whose live state query
+// fails (killed, knocked off its tile, or sitting past the vision edge
+// where the mask reads stale). A camp that fails is_visible() throws
+// error 97 on every stat read — skip it here so no caller has to.
+std::vector<cambc::camp> visible_camps()
+{
+    std::vector<cambc::camp> out;
+    for (const auto& tile : cambc::vision::camp_tiles().positions())
+        try
+        {
+            const auto c = cambc::vision::camp_at(tile);
+            if (c.is_visible()) out.push_back(c);
+        }
+        catch (const cambc::error&) { }
+    return out;
+}
+
+// Same mask-vs-entity gap for champions: a teleporter or fresh corpse can
+// vanish between champion_tiles() and champion_at().
+std::vector<cambc::champion> visible_enemies()
+{
+    std::vector<cambc::champion> out;
+    for (const auto& tile : cambc::vision::champion_tiles(cambc::team::enemy).positions())
+        try
+        {
+            const auto e = cambc::vision::champion_at(tile);
+            if (e.is_visible()) out.push_back(e);
+        }
+        catch (const cambc::error&) { }
+    return out;
+}
+
 std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     int only_group = -1, bool harmless_only = false)
 {
@@ -211,7 +320,7 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     if (harmless_only)
     {
         dangerous.assign(groups().size(), 0);
-        for (const auto& c : cambc::vision::camps())
+        for (const auto& c : visible_camps())
             if (c.health() > 0 && c.strength() > 0)
             {
                 const int g = group_of(c.spawn_position());
@@ -221,7 +330,7 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     bool found = false;
     cambc::vec2 best{};
     float best_health = 0;
-    for (const auto& c : cambc::vision::camps())
+    for (const auto& c : visible_camps())
     {
         if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
         const int g = group_of(c.spawn_position());
@@ -241,6 +350,40 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     return exec::Attack{ best, exec::Attack::Kind::camp };
 }
 
+// A ready damage/cc payload on the engaged group out-damages a basic
+// swing, and stunned members skip their retaliation — the planner's kit
+// dps already prices this in (burst amortized over the 8-round cooldown),
+// so a runtime that never casts clears slower than the gate believes.
+// Restricted to the active target: focused-fire, never wake a bystander.
+std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
+{
+    const auto& me = cambc::self();
+    if (!me.can_cast()) return std::nullopt;
+    // abilities() returns its array by value — a reference bound to
+    // abilities()[slot] dangles off a destroyed temporary and reads a
+    // garbage owner handle (engine error 97) on the next query.
+    const auto abilities = me.abilities();
+    for (std::uint8_t slot = 0; slot < 2; ++slot)
+    {
+        if (mem.cast_banned[slot]) continue;
+        const auto& ab = abilities[slot];
+        if (!ab.is_ready() || (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()))
+            continue;
+        const bool ground = ab.can_target_ground();
+        if (!ab.can_target_camps() && !ground) continue;
+        cambc::bitboard tiles{ cambc::uninitialized };
+        ab.mask_into(tiles);
+        for (const auto& c : visible_camps())
+            if (c.health() > 0 && group_of(c.spawn_position()) == g && tiles.is_set(c.position()))
+            {
+                mem.last_cast_slot = slot;
+                mem.last_cast_round = round;
+                return exec::Cast{ slot, c.position(), ground };
+            }
+    }
+    return std::nullopt;
+}
+
 exec::Action done(State next, const exec::Action& action, const Obs& obs)
 {
     if (next != mem.state)
@@ -255,6 +398,7 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
 
 exec::Action exec::tick(const Obs& obs, const Plan& plan)
 {
+    try {
     using cs = cambc::champion_state;
     const auto st = obs.self_state;
     my_slot();
@@ -266,13 +410,78 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         || (!st.contains(cs::can_move) && !st.contains(cs::can_attack)))
         return done(State::channel, Wait{}, obs);
 
-    if (const auto offer = tactic::offer(obs))
-        return done(State::tactic, *offer, obs);
+    // Cast-fizzle verify: a successful cast spends the 8-turn cooldown, so
+    // a slot still ready the very next round fizzled (thrown at apply).
+    // Three in a row retires the slot — without this a fizzling cast is
+    // re-emitted every turn forever.
+    if (mem.last_cast_slot >= 0 && obs.round > mem.last_cast_round)
+    {
+        try
+        {
+            const auto s = static_cast<std::size_t>(mem.last_cast_slot);
+            if (obs.round == mem.last_cast_round + 1)
+            {
+                if (cambc::self().abilities()[s].is_ready())
+                {
+                    if (++mem.cast_strikes[s] >= 3) mem.cast_banned[s] = true;
+                }
+                else
+                    mem.cast_strikes[s] = 0;
+            }
+        }
+        catch (const cambc::error&) { }
+        mem.last_cast_slot = -1;
+    }
+
+    // Tactic modules make their own live reads (buffs, consumables, a
+    // recaller query per enemy) — a stale read there must not fault the
+    // turn, only skip the offer. std::exception, not just cambc::error:
+    // a module's own bad_variant_access/out_of_range would otherwise
+    // escape to the whole-tick catch and cost the turn, not the offer.
+    try
+    {
+        if (const auto offer = tactic::offer(obs))
+            return done(State::tactic, *offer, obs);
+    }
+    catch (const std::exception&) { }
 
     const auto& geos = groups();
     const cambc::vec2 pos = obs.self_pos;
     const int here = group_of(pos);
     const bool at_spawn = cambc::map::spawn_region(cambc::team::ally).is_set(pos);
+
+    if (mem.strikes.size() != geos.size()) mem.strikes.assign(geos.size(), 0);
+    if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
+    // A group seen dead clears its strike history: someone ground it down
+    // this life, so prior failed sorties no longer evidence a trap.
+    for (const auto& c : obs.camps)
+        if (c.group < mem.strikes.size()
+            && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
+                || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
+            mem.strikes[c.group] = 0;
+    // Snapshot live member hp/dps sums — rebuilt each round from the
+    // members currently in vision, so an edge-of-vision sighting
+    // overwrites a fuller read with the subset sum and heal_target
+    // under-prices the real pack (a known under-estimate, tolerated: the
+    // miss only releases a sortie early). Camps don't regen, so a full
+    // read stays exact until someone else touches the pack.
+    for (const auto& c : visible_camps())
+    {
+        const int g = group_of(c.spawn_position());
+        if (g < 0) continue;
+        auto& left = mem.camp_left[static_cast<std::size_t>(g)];
+        if (left.round != static_cast<std::int32_t>(obs.round))
+        {
+            left.hp = 0;
+            left.dps = 0;
+            left.round = static_cast<std::int32_t>(obs.round);
+        }
+        if (c.health() > 0)
+        {
+            left.hp += c.health();
+            left.dps += c.strength();
+        }
+    }
 
     // Lethal-threat proxy: a visible enemy champion inside maximum attack
     // reach (3). Enemy camps aren't observable here, so plain low-HP stays
@@ -281,7 +490,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     bool threat = false;
     for (const auto& e : obs.enemies)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
-    const bool dying = obs.self_health < obs.self_max_health * 0.35f;
+    const bool dying = obs.self_health < obs.self_max_health * retreat_floor;
     const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
 
     // A recall we emitted that never shows in champion_state was cancelled
@@ -340,14 +549,64 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // The retreat arm is sticky: a champion already fleeing stays on the
     // retreat below 75% — re-checking `unsafe` each turn flickers between
     // TRAVEL and PITSTOP when a threat pops in and out of vision.
-    const bool retreating = mem.state == State::pitstop
-        && obs.self_health < obs.self_max_health * 0.75f;
-    if (unsafe || retreating
-        || (mem.state == State::pitstop && at_spawn && obs.self_health < obs.self_max_health * 0.9f))
+    // Heal-to-need: a return sortie's spendable budget is capped by the
+    // retreat floor, so healing past (expected retaliation + floor) buys
+    // nothing — spawn heals to full at turn end (GameRules §Recalling),
+    // so every surplus point waited on costs a whole turn of commute on a
+    // camp the last sortie already chewed. Champion scares and non-sortie
+    // exits heal full: the commute itself stays dangerous.
+    float heal_target = obs.self_max_health * 0.9f;
+    if (mem.fled_group >= 0 && mem.fled_group < static_cast<int>(geos.size()))
     {
+        const auto& left = mem.camp_left[static_cast<std::size_t>(mem.fled_group)];
+        const float hp_left = left.hp >= 0 ? left.hp : geos[mem.fled_group].health;
+        const float dps_left = left.hp >= 0 ? left.dps : geos[mem.fled_group].dps;
+        if (hp_left > 0)
+            heal_target = std::min(heal_target, obs.self_max_health * retreat_floor
+                + dps_left * std::max(1.0f, hp_left / my_dps()) * 1.25f);
+    }
+    // Pitstop release: mid-retreat stays sticky below 75% (re-checking
+    // `unsafe` flickers when a threat pops in and out of vision); at spawn,
+    // the heal target above.
+    const bool recovered = mem.state != State::pitstop
+        || (at_spawn ? obs.self_health >= heal_target
+                     : obs.self_health >= obs.self_max_health * 0.75f);
+    if (unsafe || !recovered)
+    {
+        // fled_group prices the heal target against the pack that dealt
+        // the damage — the group we're standing in, not the route
+        // destination. Off the tiles (ranged ring, mid-commute) the active
+        // target stays the better guess.
+        if (mem.state != State::pitstop)
+            mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
+                && !threat ? (here >= 0 ? here : mem.active_target) : -1;
+        // Sortie watchdog: contested exits only — an attrition bail is
+        // paid-for progress (the pack keeps its wounds), while a bail
+        // under enemy reach buys nothing. Pure-grind maps would otherwise
+        // blacklist their only work. A camp that died mid-sortie (reward
+        // or respawn already visible) is a success either way.
+        if ((mem.state == State::travel || mem.state == State::clear)
+            && mem.active_target >= 0 && threat)
+        {
+            const CampObs* c = seen(obs, mem.active_target);
+            const bool died = c
+                && (std::holds_alternative<cambc::map::camp_group_respawning>(c->state)
+                    || std::holds_alternative<cambc::map::camp_group_reward_available>(c->state));
+            if (!died)
+            {
+                const auto g = static_cast<std::size_t>(mem.active_target);
+                if (++mem.strikes[g] >= strike_limit)
+                {
+                    if (mem.unreachable_until.size() != geos.size())
+                        mem.unreachable_until.assign(geos.size(), 0);
+                    mem.unreachable_until[g] = obs.round + strike_cooldown;
+                    mem.strikes[g] = 0;
+                }
+            }
+        }
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
         bool exposed = threat;
-        for (const auto& c : cambc::vision::camps())
+        for (const auto& c : visible_camps())
             if (!exposed && c.health() > 0 && c.strength() > 0
                 && pos.chebyshev_distance(c.position()) <= c.attack_range())
                 exposed = true;
@@ -428,6 +687,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     int target = -1;
     bool target_reward = false;
     std::int64_t target_cost = 0;
+    int fit_gem_supply = 0; // owned/route gem camps this body could ever solo
     // Gold-only camps are filler: the race is 1000 tributed gems, so the
     // best gem-bearing target always wins and a 0-gem camp is picked only
     // when no gem target is actionable at all.
@@ -447,14 +707,24 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // two-tier scan (route only, then grind on exhaustion) made Vendetta
     // march past an owned pack to the map's far edge on rows.
     std::uint64_t scanned = 0; // group ids share mem.owned's <64 space
-    const auto consider = [&](int g, std::int8_t cursor_idx) {
+    const auto consider = [&](int g, std::int8_t cursor_idx, bool relaxed) {
         if (g < 0 || g >= static_cast<int>(geos.size()) || ((scanned >> g) & 1)) return;
         scanned |= 1ull << g;
-        if (geos[g].monolith || unreachable(g, obs.round)) return;
+        // The unfit gate must sit ahead of the active-target mark below:
+        // a camp this body can't solo has to drop out of hysteresis, not
+        // ride the +8 margin into another doomed sortie. But it sits BEHIND
+        // the lifecycle read: a pending reward has no fight left to be
+        // unfit for — crossfire kills leave free five-round captures the
+        // owner never fought, and gating those leaks the reward entirely.
+        if (geos[g].monolith) return;
+        const bool is_unfit = unfit(geos[g], obs.self_max_health);
+        if (geos[g].gems && !is_unfit) ++fit_gem_supply;
+        if (unreachable(g, obs.round)) return;
         bool reward = false;
         if (const CampObs* c = seen(obs, g))
         {
-            if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state)) return;
+            if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state))
+                return;
             if (std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
             {
                 if (enemy_on(g, obs)) return; // contested, we hold nothing: move on
@@ -464,7 +734,16 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         else if (ledger::ready_round(g) > static_cast<std::int32_t>(obs.round))
             return;
-        const auto cost = dist_to(geos[g], pos);
+        if (is_unfit && !reward && !relaxed) return;
+        // Cost ≈ commute + expected sortie churn: each sortie spends a
+        // recall, a heal and a return walk (~80t at speed 1), so a passive
+        // cluster two screens away beats a three-sortie wolf next door
+        // for a body that can't tank it. Fit kits price ~0 extra — the
+        // gate already guarantees they clear inside one bar.
+        const float sorties = geos[g].passive ? 0.0f
+            : geos[g].dps * (geos[g].health / my_dps()) / (obs.self_max_health * 0.65f);
+        const auto cost = dist_to(geos[g], pos)
+            + static_cast<std::int64_t>(sorties * 60.0f);
         if (g == mem.active_target) { active_state = reward ? 2 : 1; active_cost = cost; }
         int& bt = geos[g].gems ? target : gold_target;
         bool& br = geos[g].gems ? target_reward : gold_reward;
@@ -478,24 +757,34 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
     };
 
-    if (mem.have_route)
-    {
-        // Cyclic scan from the cursor — strict cycle order would force
-        // cross-map legs between respawns; the winning pattern is
-        // re-harvesting the same few camps each period.
-        const auto n = mem.route.size();
-        for (std::uint8_t i = 0; i < n; ++i)
+    const auto scan = [&](bool relaxed) {
+        if (mem.have_route)
         {
-            const auto idx = static_cast<std::uint8_t>((mem.cursor + i) % n);
-            if (const Stop stop = mem.route[idx]; stop.kind == StopKind::CAMP)
-                consider(stop.index, static_cast<std::int8_t>(idx));
+            // Cyclic scan from the cursor — strict cycle order would force
+            // cross-map legs between respawns; the winning pattern is
+            // re-harvesting the same few camps each period.
+            const auto n = mem.route.size();
+            for (std::uint8_t i = 0; i < n; ++i)
+            {
+                const auto idx = static_cast<std::uint8_t>((mem.cursor + i) % n);
+                if (const Stop stop = mem.route[idx]; stop.kind == StopKind::CAMP)
+                    consider(stop.index, static_cast<std::int8_t>(idx), relaxed);
+            }
         }
-    }
-    // The modulo partition under the route: unrouted leftovers (packs above
-    // the solo floor, monolith-adjacent) still have an owner to grind them;
-    // without a route this IS the whole job.
-    for (std::size_t g = 0; g < geos.size(); ++g)
-        if (mine(static_cast<int>(g))) consider(static_cast<int>(g), -1);
+        // The modulo partition under the route: unrouted leftovers (packs
+        // above the solo floor, monolith-adjacent) still have an owner to
+        // grind them; without a route this IS the whole job.
+        for (std::size_t g = 0; g < geos.size(); ++g)
+            if (mine(static_cast<int>(g))) consider(static_cast<int>(g), -1, relaxed);
+    };
+    scan(false);
+    // Desperation pass: a body that owns zero fit gem camps (elkring,
+    // rows — every pack above the solo floor) can't sit on 0-gem gold or
+    // idle forever; the tribute race is paid in gems, so it grinds the
+    // least-bad trap. Mixed-map bodies always own some fit supply — a
+    // respawn lull never reads as desperation.
+    const bool desperate = fit_gem_supply == 0;
+    if (desperate) { scanned = 0; scan(true); }
 
     if (target < 0) { target = gold_target; target_reward = gold_reward; }
     // An in-flight gold errand is preemptible the moment real work exists.
@@ -531,12 +820,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // Alive (or believed): hit the target already in range — focused
         // fire, so a passerby group never gets woken on the way in —
         // else descend to a free tile inside our own attack ring.
+        if (const auto cast = camp_cast(target, obs.round))
+            return done(State::clear, *cast, obs);
         const auto attack_tiles = cambc::self().attack_tiles();
         if (const auto hit = attack_in_range(attack_tiles, target))
             return done(State::clear, *hit, obs);
         cambc::bitboard goals;
         const auto range = static_cast<float>(cambc::self().attack_range());
-        for (const auto& member : cambc::vision::camps())
+        for (const auto& member : visible_camps())
             if (member.health() > 0 && group_of(member.spawn_position()) == target)
                 goals.draw_chebyshev(member.position(), range);
         goals &= ~blocked;
@@ -553,8 +844,12 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     std::int64_t haul_dist = 0;
     for (std::size_t g = 0; g < geos.size(); ++g)
     {
+        // unfit here too: pre-parking on a trap's ring means the respawned
+        // pack wakes onto a body that can't fight it — pitstop churn with
+        // no active_target, which the strike watchdog can never see.
         if (!mine(static_cast<int>(g)) || geos[g].monolith
-            || unreachable(static_cast<int>(g), obs.round))
+            || unreachable(static_cast<int>(g), obs.round)
+            || (unfit(geos[g], obs.self_max_health) && !desperate))
             continue;
         const std::int32_t ready = ledger::ready_round(static_cast<int>(g));
         if (ready == ledger::never) continue;
@@ -592,20 +887,33 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // L1: an idle turn while an owned live uncontested camp exists is a
     // machine violation — flag it rather than hide it. Uncontested can only
     // be proven by vision: an unseen group may be enemy-held, so a ledger
-    // belief alone never flags. Unreachable groups are legitimately idle.
-    for (std::size_t g = 0; g < geos.size(); ++g)
-    {
-        if (!mine(static_cast<int>(g)) || geos[g].monolith
-            || unreachable(static_cast<int>(g), obs.round))
-            continue;
-        const CampObs* c = seen(obs, static_cast<int>(g));
-    }
+    // belief alone never flags. Unreachable and unsoloable groups are
+    // legitimately idle.
     return done(State::idle, Wait{}, obs);
+    } catch (const std::exception& err)
+    {
+        // A stale live read mid-decision costs this turn only — same as
+        // the engine-side fizzle policy apply() already follows. A
+        // deterministic throw would otherwise surface as a bare per-turn
+        // Wait — an idle body with zero diagnostics — so echo the fault
+        // the way play_turn's catch would. Rate-limited and fuel-floored:
+        // a starved turn can't afford the write.
+        static std::uint32_t next_log = 0;
+        if (obs.round >= next_log && !cambc::is_draft()
+            && cambc::fuel_remaining() >= 4000)
+        {
+            next_log = obs.round + 40;
+            std::cout << "bot error: exec::tick r" << obs.round
+                      << ": " << err.what() << '\n';
+        }
+        return exec::Wait{};
+    }
 }
 
 bool exec::apply(const Action& action)
 {
     const auto& me = cambc::self();
+    try {
     return std::visit(
         [&me](const auto& a) -> bool
         {
@@ -647,7 +955,7 @@ bool exec::apply(const Action& action)
                     float best_health = 0;
                     bool found = false;
                     cambc::vec2 hit{};
-                    for (const auto& e : cambc::vision::champions(cambc::team::enemy))
+                    for (const auto& e : visible_enemies())
                     {
                         if (!e.is_visible() || e.health() <= 0
                             || !attack_tiles.is_set(e.position())) continue;
@@ -661,7 +969,7 @@ bool exec::apply(const Action& action)
                     }
                     if (mem.nav_pending >= 0)
                     {
-                        for (const auto& c : cambc::vision::camps())
+                        for (const auto& c : visible_camps())
                         {
                             if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
                             if (group_of(c.spawn_position()) != mem.nav_pending) continue;
@@ -755,4 +1063,5 @@ bool exec::apply(const Action& action)
             }
         },
         action);
+    } catch (const std::exception&) { return false; }
 }
