@@ -58,6 +58,14 @@ The toolchain (WASI SDK, cmake, ninja) lives in `~/.cache/cambc` — installed b
 - `./cambc.exe view` — open the latest replay in the visualiser.
 - `./cambc.exe bundle <bot>` / `submit <bot>` — package / upload a submission.
 - `./cambc.exe maps` — refresh the map pool.
+- `tools/replay/` — decode any replay (platform bundle or `cambc run -o`) into
+  per-round champion positions/hp/bags and the full action log, and report
+  behaviour metrics. `platform.py team <teamId> <dir>` pulls public match data
+  + replays; `extract.mjs <replays> <out>` decodes; `report.py <out> --groups
+  <dir>/groups --team <teamId>` (or `--side 0|1` for local runs) compares us vs
+  opponents; `story.py` storyboards one game; `local_eval.sh <bot> <opp>
+  [maps]` runs both sides and reports the same metrics. Our team on the
+  platform is "Heavenly Court" (`c38052e1-f3a0-44f8-a433-ef47a9d1181c`).
 
 Matches are **deterministic in fuel, not wall-clock**. Same bots, same map, same
 seed behavior — a match result is reproducible evidence. That is what makes the

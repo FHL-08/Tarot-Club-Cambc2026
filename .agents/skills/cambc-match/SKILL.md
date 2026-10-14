@@ -58,3 +58,27 @@ commit match manifests or outputs (`matches/`, `replays/` are gitignored).
 - `./cambc.exe maps` refreshes the published map pool into `maps/`.
 - `./cambc.exe bundle|submit` touches the platform account — only when
   the user asks, never inside a factory run.
+
+## Replay analysis (tools/replay)
+
+Platform match data and bundles are public; the local `cambc.exe view` server ships the engine
+WASM and the visualiser's own snapshot decoders, which `tools/replay` drives headlessly.
+
+```bash
+python3 tools/replay/platform.py find "Heavenly"                       # team id by name
+python3 tools/replay/platform.py team <teamId> /tmp/scout              # groups + replay zips
+node tools/replay/extract.mjs /tmp/scout/replays /tmp/scout/traj       # decode (~2s/game)
+python3 tools/replay/report.py /tmp/scout/traj --groups /tmp/scout/groups --team <teamId> --check
+python3 tools/replay/report.py /tmp/scout/traj --groups /tmp/scout/groups --team <teamId>
+python3 tools/replay/story.py /tmp/scout/traj/<matchId>.json --side 0 --step 20
+tools/replay/local_eval.sh foundry foundry-v1 expanse corners          # both sides, same metrics
+```
+
+- `--check` must report N/N: decoded final banked gems and per-champion kills equal the
+  platform's official statistics. Run it after any cambc upgrade (assets refresh from the
+  installed visualiser on first use; delete `tools/replay/.cache` to force).
+- Team B moves second each round and wins measurably more on the platform — always
+  evaluate both sides.
+- Trajectory rounds carry `[team, type, alive, x, y, hp, maxHp, bag, gold, kills]` per champion
+  (type = SDK `champion_type`); actions are `[round, actor, kind, fromX, fromY, toX, toY, bag,
+  gold, hits]` with kind 4 move, 5 attack, 6 cast, 11 channel, 12 ward, 13 shop, 20 consumable.
