@@ -380,25 +380,41 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const bool bank_now = over_cap || econ::should_tribute(obs);
     if (bank_now)
     {
-        cambc::vec2 nearest{};
+        cambc::vec2 nearest{}, locked{};
         std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
+        std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
         cambc::bitboard rings;
         const auto altars = cambc::map::altars().positions();
         // A locked route altar falls back to the nearest unlocked one.
         if (preferred >= 0 && cambc::vision::has_altar_lock(altars[preferred])) preferred = -1;
         for (std::size_t a = 0; a < altars.size(); ++a)
         {
+            const auto altar = altars[a];
+            // The route's spliced ALTAR stop is the planned tribute point:
+            // while it stands unlocked, other altars don't compete.
             if (preferred >= 0 && static_cast<std::int32_t>(a) != preferred) continue;
-            if (cambc::vision::has_altar_lock(altars[a])) continue;
-            rings.draw_chebyshev(altars[a], cambc::constants::submit_gems_range);
-            if (const auto d = pos.chebyshev_distance(altars[a]); d < nearest_d)
+            // An enemy lock turns the tribute attempt into a lock attack
+            // (GameRules §Tributing against a lock) — taking the nearest
+            // locked altar still clears it, while our own locks never block
+            // us and unlocked altars always win the pick.
+            const bool enemy_locked = cambc::vision::has_altar_lock(altar)
+                && cambc::vision::altar_lock_at(altar).is_enemy();
+            rings.draw_chebyshev(altar, cambc::constants::submit_gems_range);
+            if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < nearest_d)
             {
                 nearest_d = d;
-                nearest = altars[a];
+                nearest = altar;
+            }
+            else if (enemy_locked && d < locked_d)
+            {
+                locked_d = d;
+                locked = altar;
             }
         }
         if (nearest_d <= cambc::constants::submit_gems_range)
             return done(State::bank, Channel{ Channel::Kind::tribute, nearest }, obs);
+        if (locked_d <= cambc::constants::submit_gems_range)
+            return done(State::bank, Channel{ Channel::Kind::tribute, locked }, obs);
         rings &= ~blocked;
         if (!rings.is_empty()) // every approach tile occupied: bank later
             return done(State::bank, Move{ std::move(rings) }, obs);
@@ -690,6 +706,8 @@ bool exec::apply(const Action& action)
                 if (!me.can_cast() || a.slot >= 2) return false;
                 if (a.ground)
                 {
+                    // A stale or out-of-range ground tile throws; treat it
+                    // like any other fizzled action, not a faulted turn.
                     try { return me.abilities()[a.slot].use(a.target); }
                     catch (const cambc::error&) { return false; }
                 }
@@ -712,10 +730,17 @@ bool exec::apply(const Action& action)
                     try { me.recall(); return true; }
                     catch (const cambc::error&) { return false; }
                 }
-                // An altar locked since the tick's visibility query turns
-                // the tribute into an error or lock-attack — skip, don't
-                // fault the whole turn.
+                // An enemy-locked altar converts the tribute into a lock
+                // attack (GameRules §Tributing against a lock); a stale or
+                // illegal altar still throws — fizzle, don't fault.
                 try { me.submit_gems(a.altar); return true; }
+                catch (const cambc::error&) { return false; }
+            }
+            else if constexpr (std::is_same_v<T, UseItem>)
+            {
+                // Consumables ride their own allowance; a hidden obstruction
+                // or a lock that landed in between returns false cleanly.
+                try { return me.consumables()[a.item].use(a.target); }
                 catch (const cambc::error&) { return false; }
             }
             else if constexpr (std::is_same_v<T, Buy>)
