@@ -12,6 +12,8 @@ namespace econ {
 // Run the champion's build queue plus consumable top-up. Legal whenever the
 // engine allows shopping — spawn tiles or dead turns both count, so callers
 // invoke this even on turns where the champion cannot act otherwise.
+// Consumable policy is route-aware: a slot whose compiled route passes an
+// enemy-side altar stocks its lock ahead of shard gold (issue #24).
 void maybe_buy(Role role, const Obs& obs);
 
 // True when the carried bag should be banked now: at/above the role-scaled

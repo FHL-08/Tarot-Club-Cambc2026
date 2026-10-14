@@ -37,7 +37,8 @@ std::optional<exec::Action> tactic::lock(const Obs& obs)
     };
     const auto place = [&](cambc::vec2 altar) -> exec::Action {
         alarm_altar(obs, altar_index(altar));
-        std::cout << "TACTIC lock: placed @r" << obs.round << '\n';
+        std::cout << "TACTIC lock: placed @r" << obs.round
+                  << " (" << altar.x << "," << altar.y << ")\n";
         return exec::UseItem{ cambc::consumable_type::altar_lock, altar };
     };
 
