@@ -83,7 +83,9 @@ fi
 # the caller's session dies with that session, which is what kept leaving the
 # user's tab on "Unable to connect".
 cd "$root"
-setsid nohup ./cambc.exe view --port "$port" "$replay" > "$log" 2>&1 < /dev/null &
+# cambc view would open its own tab immediately (before it is serving) and
+# again on every restart; suppress it and open one tab ourselves once live.
+BROWSER=true setsid nohup ./cambc.exe view --port "$port" "$replay" > "$log" 2>&1 < /dev/null &
 for _ in $(seq 1 40); do
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
   [ "$code" = 200 ] && break
@@ -91,5 +93,9 @@ for _ in $(seq 1 40); do
 done
 [ "${code:-}" = 200 ] || die "visualiser did not come up on :$port (see $log)"
 url="$(grep -oE 'http://127\.0\.0\.1:[0-9]+/[^ ]*' "$log" | head -1)"
-echo "viz: serving $(basename "$replay") — ${url:-http://127.0.0.1:$port/}"
-echo "viz: keep one tab on http://127.0.0.1:$port/ and reload it after each viz.sh call"
+url="${url:-http://127.0.0.1:$port/}"
+echo "viz: serving $(basename "$replay") — $url"
+if [ -z "${VIZ_NO_BROWSER:-}" ]; then
+  setsid xdg-open "$url" >/dev/null 2>&1 < /dev/null || echo "viz: could not open a browser — open $url yourself"
+fi
+echo "viz: opened a tab on $url (VIZ_NO_BROWSER=1 to skip); older 7026 tabs just need a reload"
