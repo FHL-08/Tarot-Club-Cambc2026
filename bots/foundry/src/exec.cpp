@@ -55,7 +55,7 @@ constexpr std::uint32_t strike_cooldown = 200;
 // release reserve below it would discharge a body the dying check
 // re-traps the very next turn, and a sortie budgeted to a lower floor
 // lands its last hit already past the bail line.
-constexpr float retreat_floor = 0.40f;
+constexpr float retreat_floor = 0.55f;
 
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
@@ -615,7 +615,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     for (const auto& e : obs.enemies)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
     const bool dying = obs.self_health < obs.self_max_health * retreat_floor;
-    const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.6f);
+    const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.75f);
 
     // A recall we emitted that never shows in champion_state was cancelled
     // by damage/stun between turns; a completed one lands on spawn.
@@ -640,7 +640,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 // Low HP alone doesn't break the stand — the group's own
                 // camps are dead and strangers sleep two rounds after we
                 // stop poking — but an enemy champion in reach does.
-                if (!(threat && obs.self_health < obs.self_max_health * 0.6f))
+                if (!(threat && obs.self_health < obs.self_max_health * 0.75f))
                 {
                     const auto attack_tiles = cambc::self().attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
