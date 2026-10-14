@@ -9,6 +9,8 @@
 // of the observation history.
 #include <cambc.h>
 #include "exec.h"
+#include "econ.h"
+#include "tactic/support.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -22,6 +24,7 @@
 #include "ledger.h"
 #include "nav.h"
 #include "obs.h"
+#include "turn.h"
 #include "plan.h"
 #include "tactic/tactic.h"
 
@@ -116,7 +119,7 @@ const std::vector<GroupGeo>& groups()
         // map (same dodge as atlas.cpp's design cache).
         std::array<std::optional<cambc::camp_stats>, 16> designs;
         std::vector<GroupGeo> out;
-        for (const auto& group : cambc::map::camp_groups())
+        for (const auto& group : turn::map_groups())
         {
             GroupGeo geo;
             group.spawn_tiles_into(geo.tiles);
@@ -163,7 +166,7 @@ int my_slot()
     if (mem.slot >= 0) return mem.slot;
     const auto allies = cambc::champions(cambc::team::ally);
     mem.allies = static_cast<int>(allies.size());
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     for (std::size_t i = 0; i < allies.size(); ++i)
         if (allies[i] == me) { mem.slot = static_cast<int>(i); break; }
     if (mem.slot < 0) mem.slot = 0; // self unlisted: fall back to slot zero
@@ -210,7 +213,7 @@ bool mine(int g)
 float my_dps()
 {
     static const float dps = [] {
-        const auto& me = cambc::self();
+        const auto& me = turn::self();
         const auto stats = me.base_stats();
         const float basic = stats.base_strength * stats.camp_damage_multiplier;
         float burst = 0;
@@ -236,9 +239,7 @@ bool unfit(const GroupGeo& g, float my_max_health)
 
 const CampObs* seen(const Obs& obs, int g)
 {
-    for (const auto& c : obs.camps)
-        if (c.group == g) return &c;
-    return nullptr;
+    return (g >= 0 && g < 64) ? obs.camp_at[static_cast<std::size_t>(g)] : nullptr;
 }
 
 bool unreachable(int g, std::uint32_t round)
@@ -251,13 +252,10 @@ bool unreachable(int g, std::uint32_t round)
 
 // Identical legality mask to nav.cpp's blocked_tiles — goal seeds must be
 // masked with it because an occupied goal tile would still seed the descent.
-cambc::bitboard blocked_tiles()
+// Served from the per-turn cache in turn.h.
+const cambc::bitboard& blocked_tiles()
 {
-    auto blocked = cambc::map::walls() | cambc::map::holes() | cambc::map::altars()
-        | cambc::map::spawn_region(cambc::team::enemy) | cambc::vision::champion_tiles()
-        | cambc::vision::camp_tiles() | cambc::vision::teleport_tiles();
-    blocked.set(cambc::self().position(), false);
-    return blocked;
+    return turn::blocked_tiles();
 }
 
 std::int64_t dist_to(const GroupGeo& g, cambc::vec2 p)
@@ -289,7 +287,7 @@ int opening_stop(int index)
     if (!seeded)
     {
         used.assign(geos.size(), 0);
-        origin = cambc::map::spawn_region(cambc::team::ally);
+        origin = turn::spawn_region(cambc::team::ally);
         seeded = true;
     }
     // Whole-team clear estimate: the opening bodies fight together, so the
@@ -321,7 +319,7 @@ int opening_stop(int index)
         }
         return std::max(total, 1.0f);
     }();
-    static const auto raw = cambc::map::camp_groups();
+    static const auto& raw = turn::map_groups();
     static const auto hard = cambc::map::walls() | cambc::map::holes()
         | cambc::map::altars() | cambc::map::spawn_region(cambc::team::enemy);
     while (static_cast<int>(stops.size()) <= index && !exhausted)
@@ -355,21 +353,6 @@ int opening_stop(int index)
     return static_cast<int>(stops.size()) > index ? stops[index] : -1;
 }
 
-const std::vector<int>& opening_stops()
-{
-    static const std::vector<int> stops = [] {
-        std::vector<int> out;
-        for (int s = 0; s < 3; ++s)
-        {
-            const int g = opening_stop(s);
-            if (g < 0) break;
-            out.push_back(g);
-        }
-        return out;
-    }();
-    return stops;
-}
-
 bool enemy_on(int g, const Obs& obs)
 {
     for (const auto& e : obs.enemies)
@@ -391,44 +374,79 @@ bool enemy_on(int g, const Obs& obs)
 // The tick calls this several times and each rebuild is a camp_tiles()
 // mask plus a camp_at+is_visible pair per tile. Vision only changes
 // between rounds or when this body itself moved (post-move apply), so
-// memoise on (round, body, position).
-const std::vector<cambc::camp>& visible_camps()
+// memoise on (round, body, position). Stats ride along in the snapshot:
+// within one body's turn only its own attack can change them, and no
+// camp-stat read happens after an attack at the same position.
+struct LiveCamp {
+    cambc::camp handle;
+    cambc::vec2 pos{};
+    cambc::vec2 spawn{};
+    float health = 0;
+    float strength = 0;
+    std::int64_t attack_range = 0;
+};
+
+const std::vector<LiveCamp>& visible_camps()
 {
-    static std::vector<cambc::camp> cache;
+    static std::vector<LiveCamp> cache;
     static std::uint32_t cached_round = 0;
-    static int cached_name = -1;
-    static cambc::vec2 cached_pos{};
-    const auto& me = cambc::self();
-    const auto pos = me.position();
+    static std::uint32_t cached_epoch = 0;
     const auto round = cambc::round_number();
-    const int name = static_cast<int>(me.champion_name());
-    if (round == cached_round && name == cached_name && pos == cached_pos)
+    if (round == cached_round && turn::move_epoch() == cached_epoch)
         return cache;
-    cached_round = round; cached_name = name; cached_pos = pos;
+    cached_round = round; cached_epoch = turn::move_epoch();
     cache.clear();
-    for (const auto& tile : cambc::vision::camp_tiles().positions())
+    // One sdk_camp record per visible camp replaces the is_visible +
+    // position + health + strength chain of identical host fetches;
+    // attack_range is design data, cached per kind. A hidden/missing
+    // camp throws into the same catch as before.
+    static const std::array<std::int64_t, 8> ranges = [] {
+        std::array<std::int64_t, 8> out{};
+        for (std::size_t k = 0; k < out.size(); ++k)
+        {
+            cambc::detail::camp_design design{};
+            out[k] = cambc::detail::sdk_camp_design(static_cast<std::int32_t>(k), &design) == 0
+                ? design.base_stats.base_attack_range : 1;
+        }
+        return out;
+    }();
+    for (const auto& tile : turn::camp_tiles().positions())
         try
         {
             const auto c = cambc::vision::camp_at(tile);
-            if (c.is_visible()) cache.push_back(c);
+            cambc::detail::camp_state info{};
+            if (cambc::detail::sdk_camp(static_cast<std::uint32_t>(static_cast<cambc::handle_camp_t>(c)),
+                    &info) != 0)
+                continue;
+            const auto k = static_cast<std::size_t>(c.kind());
+            cache.push_back({ c, { info.x, info.y }, c.spawn_position(), info.health,
+                info.strength, k < ranges.size() ? ranges[k] : 1 });
         }
         catch (const cambc::error&) { }
     return cache;
 }
 
 // Same mask-vs-entity gap for champions: a teleporter or fresh corpse can
-// vanish between champion_tiles() and champion_at().
-std::vector<cambc::champion> visible_enemies()
+// vanish between champion_tiles() and champion_at(). Memoised on
+// (round, body, position) for the same reason as visible_camps().
+const std::vector<cambc::champion>& visible_enemies()
 {
-    std::vector<cambc::champion> out;
-    for (const auto& tile : cambc::vision::champion_tiles(cambc::team::enemy).positions())
+    static std::vector<cambc::champion> cache;
+    static std::uint32_t cached_round = 0;
+    static std::uint32_t cached_epoch = 0;
+    const auto round = cambc::round_number();
+    if (round == cached_round && turn::move_epoch() == cached_epoch)
+        return cache;
+    cached_round = round; cached_epoch = turn::move_epoch();
+    cache.clear();
+    for (const auto& tile : turn::champion_tiles(cambc::team::enemy).positions())
         try
         {
             const auto e = cambc::vision::champion_at(tile);
-            if (e.is_visible()) out.push_back(e);
+            if (e.is_visible()) cache.push_back(e);
         }
         catch (const cambc::error&) { }
-    return out;
+    return cache;
 }
 
 std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
@@ -439,9 +457,9 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     {
         dangerous.assign(groups().size(), 0);
         for (const auto& c : visible_camps())
-            if (c.health() > 0 && c.strength() > 0)
+            if (c.health > 0 && c.strength > 0)
             {
-                const int g = group_of(c.spawn_position());
+                const int g = group_of(c.spawn);
                 if (g >= 0) dangerous[static_cast<std::size_t>(g)] = 1;
             }
     }
@@ -450,18 +468,18 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     float best_health = 0;
     for (const auto& c : visible_camps())
     {
-        if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
-        const int g = group_of(c.spawn_position());
+        if (c.health <= 0 || !attack_tiles.is_set(c.pos)) continue;
+        const int g = group_of(c.spawn);
         if (g < 0 || (only_group >= 0 && g != only_group) || (only_group < 0 && !mine(g))
             || (!dangerous.empty() && dangerous[static_cast<std::size_t>(g)]))
             continue;
-        const auto p = c.position();
-        if (!found || c.health() < best_health
-            || (c.health() == best_health && (p.x < best.x || (p.x == best.x && p.y < best.y))))
+        const auto p = c.pos;
+        if (!found || c.health < best_health
+            || (c.health == best_health && (p.x < best.x || (p.x == best.x && p.y < best.y))))
         {
             found = true;
             best = p;
-            best_health = c.health();
+            best_health = c.health;
         }
     }
     if (!found) return std::nullopt;
@@ -475,28 +493,25 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
 // Restricted to the active target: focused-fire, never wake a bystander.
 std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
 {
-    const auto& me = cambc::self();
-    if (!me.can_cast()) return std::nullopt;
-    // abilities() returns its array by value — a reference bound to
-    // abilities()[slot] dangles off a destroyed temporary and reads a
-    // garbage owner handle (engine error 97) on the next query.
-    const auto abilities = me.abilities();
+    const auto& me = turn::self();
+    if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
+    const auto& abilities = turn::abilities();
     for (std::uint8_t slot = 0; slot < 2; ++slot)
     {
         if (mem.cast_banned[slot]) continue;
         const auto& ab = abilities[slot];
-        if (!ab.is_ready() || (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()))
+        if (!turn::slot_ready(slot) || (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()))
             continue;
-        const bool ground = ab.can_target_ground();
-        if (!ab.can_target_camps() && !ground) continue;
-        cambc::bitboard tiles{ cambc::uninitialized };
-        ab.mask_into(tiles);
+        const bool ground = turn::slot_targets(slot).contains(cambc::ability_target_mask::ground);
+        if (!turn::slot_targets(slot).contains(cambc::ability_target_mask::camps) && !ground)
+            continue;
+        const cambc::bitboard& tiles = turn::slot_reach(slot);
         for (const auto& c : visible_camps())
-            if (c.health() > 0 && group_of(c.spawn_position()) == g && tiles.is_set(c.position()))
+            if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos))
             {
                 mem.last_cast_slot = slot;
                 mem.last_cast_round = round;
-                return exec::Cast{ slot, c.position(), ground };
+                return exec::Cast{ slot, c.pos, ground };
             }
     }
     return std::nullopt;
@@ -530,12 +545,29 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // stop 0's capture tiles; normal routing takes over from round 2.
     if (obs.round <= 1)
     {
+        // The opening chain and the tactic geo caches are static map work
+        // (~30-40k fuel each on the big maps) — building them inside the
+        // 2x first-turn budget keeps the spike off normal turns. Round-2+
+        // callers hit the same lazily-filled caches either way, so no
+        // decision input changes.
         const int g0 = opening_stop(0);
         if (g0 >= 0)
         {
             const auto free_tiles = groups()[g0].tiles & ~blocked_tiles();
             if (!free_tiles.is_empty())
             {
+                // Statics that would otherwise spike a mid-game turn —
+                // each is pure map/draft data, so warming is invisible to
+                // decisions. The heavy geo caches go through warm_statics
+                // under a fuel check instead of all landing at once.
+                opening_stop(1);
+                opening_stop(2);
+                group_at();
+                my_dps();
+                turn::abilities();
+                turn::slot_targets(0);
+                turn::slot_targets(1);
+                turn::altars();
                 mem.nav_pending = g0;
                 return done(State::travel, Move{ std::move(free_tiles) }, obs);
             }
@@ -560,7 +592,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             const auto s = static_cast<std::size_t>(mem.last_cast_slot);
             if (obs.round == mem.last_cast_round + 1)
             {
-                if (cambc::self().abilities()[s].is_ready())
+                if (turn::slot_ready(static_cast<std::uint32_t>(s)))
                 {
                     if (++mem.cast_strikes[s] >= 3) mem.cast_banned[s] = true;
                 }
@@ -580,14 +612,16 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     try
     {
         if (const auto offer = tactic::offer(obs))
-            return done(State::tactic, *offer, obs);
+        {
+                    return done(State::tactic, *offer, obs);
+        }
     }
     catch (const std::exception&) { }
 
     const auto& geos = groups();
     const cambc::vec2 pos = obs.self_pos;
     const int here = group_of(pos);
-    const bool at_spawn = cambc::map::spawn_region(cambc::team::ally).is_set(pos);
+    const bool at_spawn = turn::spawn_region(cambc::team::ally).is_set(pos);
 
     if (mem.strikes.size() != geos.size()) mem.strikes.assign(geos.size(), 0);
     if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
@@ -606,7 +640,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // read stays exact until someone else touches the pack.
     for (const auto& c : visible_camps())
     {
-        const int g = group_of(c.spawn_position());
+        const int g = group_of(c.spawn);
         if (g < 0) continue;
         auto& left = mem.camp_left[static_cast<std::size_t>(g)];
         if (left.round != static_cast<std::int32_t>(obs.round))
@@ -615,10 +649,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             left.dps = 0;
             left.round = static_cast<std::int32_t>(obs.round);
         }
-        if (c.health() > 0)
+        if (c.health > 0)
         {
-            left.hp += c.health();
-            left.dps += c.strength();
+            left.hp += c.health;
+            left.dps += c.strength;
         }
     }
 
@@ -657,7 +691,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 // stop poking — but an enemy champion in reach does.
                 if (!(threat && obs.self_health < obs.self_max_health * 0.75f))
                 {
-                    const auto attack_tiles = cambc::self().attack_tiles();
+                    const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
                     return done(State::capture, Wait{}, obs);
@@ -669,7 +703,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 const bool grace = static_cast<std::int32_t>(obs.round) - mem.contested_since <= cambc::constants::capture_time + 1;
                 if (grace && !unsafe)
                 {
-                    const auto attack_tiles = cambc::self().attack_tiles();
+                    const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
                     return done(State::capture, Wait{}, obs);
@@ -746,15 +780,15 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
         bool exposed = threat;
         for (const auto& c : visible_camps())
-            if (!exposed && c.health() > 0 && c.strength() > 0
-                && pos.chebyshev_distance(c.position()) <= c.attack_range())
+            if (!exposed && c.health > 0 && c.strength > 0
+                && pos.chebyshev_distance(c.pos) <= c.attack_range)
                 exposed = true;
         if (!exposed && mem.recall_attempts < max_recall_retries)
         {
             mem.recall_pending = true;
             return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
         }
-        return done(State::pitstop, Move{ cambc::map::spawn_region(cambc::team::ally) }, obs);
+        return done(State::pitstop, Move{ turn::spawn_region(cambc::team::ally) }, obs);
     }
 
     const auto blocked = blocked_tiles();
@@ -766,7 +800,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const bool over_cap = mem.have_route && mem.bag_cap && obs.self_gems >= mem.bag_cap;
     if (over_cap)
     {
-        const auto altars = cambc::map::altars().positions();
+        const auto& altars = turn::altars();
         for (std::uint8_t i = 0; i < mem.route.size() && preferred < 0; ++i)
             if (const Stop stop = mem.route.at(mem.cursor + i);
                 stop.kind == StopKind::ALTAR && stop.index < altars.size())
@@ -782,9 +816,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
         std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
         cambc::bitboard rings;
-        const auto altars = cambc::map::altars().positions();
+        const auto& altars = turn::altars();
         // A locked route altar falls back to the nearest unlocked one.
-        if (preferred >= 0 && cambc::vision::has_altar_lock(altars[preferred])) preferred = -1;
+        if (preferred >= 0 && turn::altar_locked(altars[preferred])) preferred = -1;
         for (std::size_t a = 0; a < altars.size(); ++a)
         {
             const auto altar = altars[a];
@@ -795,8 +829,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             // (GameRules §Tributing against a lock) — taking the nearest
             // locked altar still clears it, while our own locks never block
             // us and unlocked altars always win the pick.
-            const bool enemy_locked = cambc::vision::has_altar_lock(altar)
-                && cambc::vision::altar_lock_at(altar).is_enemy();
+            const bool enemy_locked = turn::altar_locked(altar)
+                && turn::altar_lock_is_enemy(altar);
             rings.draw_chebyshev(altar, cambc::constants::submit_gems_range);
             if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < nearest_d)
             {
@@ -925,27 +959,35 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // ready_at still says "alive" is believed live and still owed a visit.
     if (obs.round <= 90)
     {
+        // Chain stops are priced lazily — one distance field each (~30k on
+        // the big maps) — so pulling the whole vector at once spikes a
+        // normal-budget turn past 100k. opening_stop(i) computes only the
+        // stops the scan actually reaches.
+        // Chain stops are priced lazily — one distance field each (~30k on
+        // the big maps) — so pulling the whole vector at once spikes a
+        // normal-budget turn past 100k. opening_stop(i) computes only the
+        // stops the scan actually reaches; the chain still caps at three.
         const auto open_stop = [&](int after) -> int {
-            const auto& chain = opening_stops();
-            for (std::size_t i = static_cast<std::size_t>(after) + 1; i < chain.size(); ++i)
+            for (int i = after + 1; i < 3; ++i)
             {
-                const int g = chain[i];
+                const int g = opening_stop(i);
+                if (g < 0) return -1;
                 if (const CampObs* c = seen(obs, g))
                 {
                     if (std::holds_alternative<cambc::map::camp_group_respawning>(c->state))
                         continue;
-                    return static_cast<int>(i);
+                    return i;
                 }
                 const int ready = ledger::ready_round(g);
                 if (ready == ledger::never || ready > static_cast<int>(obs.round))
                     continue;
-                return static_cast<int>(i);
+                return i;
             }
             return -1;
         };
         for (int oi = open_stop(-1); oi >= 0; oi = open_stop(oi))
         {
-            const int g = opening_stops()[oi];
+            const int g = opening_stop(oi);
             const CampObs* c = seen(obs, g);
             if (!c || !std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
             {
@@ -970,12 +1012,12 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 const auto mine_d = dist_free(pos);
                 try
                 {
-                    const auto allies = cambc::champions(cambc::team::ally);
-                    const auto& me = cambc::self();
+                    const auto& allies = turn::roster(cambc::team::ally);
+                    const auto& me = turn::self();
                     for (std::size_t i = 0; i < allies.size() && stands; ++i)
                     {
                         if (allies[i] == me) continue;
-                        const auto d = dist_free(allies[i].position());
+                        const auto d = dist_free(turn::roster_position(cambc::team::ally, i));
                         if (d < mine_d || (d == mine_d && static_cast<int>(i) < mem.slot))
                             stands = false;
                     }
@@ -992,10 +1034,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     if (target < 0)
     {
         scan(false);
-        // Desperation pass: a body that owns zero fit gem camps (elkring,
-        // rows — every pack above the solo floor) can't sit on 0-gem gold or
-        // idle forever; the tribute race is paid in gems, so it grinds the
-        // least-bad trap. Mixed-map bodies always own some fit supply — a
+        // Desperation: a body that owns zero fit gem camps (elkring, rows —
+        // every pack above the solo floor) can't sit on 0-gem gold or idle
+        // forever; the tribute race is paid in gems, so it grinds the
         // respawn lull never reads as desperation.
         desperate = fit_gem_supply == 0;
         if (desperate) { scanned = 0; scan(true); }
@@ -1037,14 +1078,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // else descend to a free tile inside our own attack ring.
         if (const auto cast = camp_cast(target, obs.round))
             return done(State::clear, *cast, obs);
-        const auto attack_tiles = cambc::self().attack_tiles();
+        const auto& attack_tiles = turn::attack_tiles();
         if (const auto hit = attack_in_range(attack_tiles, target))
             return done(State::clear, *hit, obs);
         cambc::bitboard goals;
-        const auto range = static_cast<float>(cambc::self().attack_range());
+        const auto range = static_cast<float>(turn::self().attack_range());
         for (const auto& member : visible_camps())
-            if (member.health() > 0 && group_of(member.spawn_position()) == target)
-                goals.draw_chebyshev(member.position(), range);
+            if (member.health > 0 && group_of(member.spawn) == target)
+                goals.draw_chebyshev(member.pos, range);
         goals &= ~blocked;
         if (goals.is_empty()) goals = geos[target].tiles & ~blocked; // rings sealed off: walk onto the tiles
         if (goals.is_empty()) goals = geos[target].tiles;
@@ -1127,7 +1168,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
 bool exec::apply(const Action& action)
 {
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     try {
     return std::visit(
         [&me](const auto& a) -> bool
@@ -1166,7 +1207,7 @@ bool exec::apply(const Action& action)
                 // monster, and only the nav target's group is safe to wake.
                 if (moved && me.can_attack())
                 {
-                    const auto attack_tiles = me.attack_tiles();
+                    const auto& attack_tiles = turn::attack_tiles();
                     float best_health = 0;
                     bool found = false;
                     cambc::vec2 hit{};
@@ -1178,17 +1219,18 @@ bool exec::apply(const Action& action)
                         { hit = e.position(); best_health = e.health(); found = true; }
                     }
                     if (found)
-                    {
-                        try { me.attack(cambc::vision::champion_at(hit)); return true; }
-                        catch (const cambc::error&) { /* tile emptied mid-turn */ }
-                    }
+                        if (const auto* enemy = turn::enemy_at(hit))
+                        {
+                            try { me.attack(*enemy); return true; }
+                            catch (const cambc::error&) { /* tile emptied mid-turn */ }
+                        }
                     if (mem.nav_pending >= 0)
                     {
                         for (const auto& c : visible_camps())
                         {
-                            if (c.health() <= 0 || !attack_tiles.is_set(c.position())) continue;
-                            if (group_of(c.spawn_position()) != mem.nav_pending) continue;
-                            try { me.attack(c); return true; }
+                            if (c.health <= 0 || !attack_tiles.is_set(c.pos)) continue;
+                            if (group_of(c.spawn) != mem.nav_pending) continue;
+                            try { me.attack(c.handle); return true; }
                             catch (const cambc::error&) { return moved; }
                         }
                     }
@@ -1197,7 +1239,7 @@ bool exec::apply(const Action& action)
             }
             else if constexpr (std::is_same_v<T, Attack>)
             {
-                if (!me.can_attack() || !me.attack_tiles().is_set(a.target)) return false;
+                if (!me.can_attack() || !turn::attack_tiles().is_set(a.target)) return false;
                 if (a.kind == Attack::Kind::camp)
                 {
                     try
@@ -1209,8 +1251,8 @@ bool exec::apply(const Action& action)
                 }
                 try
                 {
-                    const auto enemy = cambc::vision::champion_at(a.target);
-                    if (enemy.is_enemy()) { me.attack(enemy); return true; }
+                    const auto* enemy = turn::enemy_at(a.target);
+                    if (enemy && enemy->is_enemy()) { me.attack(*enemy); return true; }
                 }
                 catch (const cambc::error&) { /* tile emptied between tick and apply */ }
                 if (a.kind == Attack::Kind::champion)
@@ -1227,7 +1269,7 @@ bool exec::apply(const Action& action)
             else if constexpr (std::is_same_v<T, Cast>)
             {
                 if (!me.can_cast() || a.slot >= 2) return false;
-                const auto abilities = me.abilities();
+                const auto& abilities = turn::abilities();
                 if (a.ground)
                 {
                     // A stale or out-of-range ground tile throws; treat it
@@ -1237,7 +1279,11 @@ bool exec::apply(const Action& action)
                 }
                 try
                 {
-                    if (!abilities[a.slot].use(cambc::vision::champion_at(a.target)))
+                    const auto* enemy = turn::enemy_at(a.target);
+                    if (!enemy)
+                        throw cambc::error{ cambc::error_code::api_not_in_vision,
+                            "tile emptied between tick and apply" };
+                    if (!abilities[a.slot].use(*enemy))
                         return false;
                 }
                 catch (const cambc::error&)
@@ -1250,7 +1296,7 @@ bool exec::apply(const Action& action)
                 // lowest-health enemy still in range.
                 if (abilities[a.slot].is_attack_reset() && me.can_attack())
                 {
-                    const auto attack_tiles = me.attack_tiles();
+                    const auto& attack_tiles = turn::attack_tiles();
                     cambc::vec2 hit{};
                     float hit_hp = std::numeric_limits<float>::max();
                     for (const auto& e : visible_enemies())
@@ -1262,10 +1308,11 @@ bool exec::apply(const Action& action)
                         }
                         catch (const cambc::error&) { continue; } // stale entity — skip this turn
                     if (hit_hp < std::numeric_limits<float>::max())
-                    {
-                        try { me.attack(cambc::vision::champion_at(hit)); }
-                        catch (const cambc::error&) { }
-                    }
+                        if (const auto* enemy = turn::enemy_at(hit))
+                        {
+                            try { me.attack(*enemy); }
+                            catch (const cambc::error&) { }
+                        }
                 }
                 return true;
             }
@@ -1304,4 +1351,28 @@ bool exec::apply(const Action& action)
         },
         action);
     } catch (const std::exception&) { return false; }
+}
+
+// One-time statics that are pure functions of the map and the draft blob.
+// Each costs ~30-45k fuel on the big maps; building one per light turn
+// (and only with clear headroom) keeps the spike off any single turn
+// without changing a single decision input.
+void exec::warm_statics()
+{
+    // ~55k covers the largest single cache (tactic geography on the big
+    // maps); a warm item only runs when the turn's real work already fit
+    // inside 45k, so the total can never reach the 100k line.
+    constexpr std::uint64_t headroom = 75000;
+    static int next_stop = 1;
+    while (cambc::fuel_remaining() >= headroom)
+    {
+        bool did = false;
+        if (next_stop <= 2 && opening_stop(next_stop) >= 0) { ++next_stop; did = true; }
+        else if (next_stop <= 2) { ++next_stop; }
+        if (!did) break;
+    }
+    if (cambc::fuel_remaining() >= headroom) tactic::groups();
+    if (cambc::fuel_remaining() >= headroom) tactic::altars();
+    if (cambc::fuel_remaining() >= headroom) turn::altars();
+    if (cambc::fuel_remaining() >= headroom) econ::warm();
 }

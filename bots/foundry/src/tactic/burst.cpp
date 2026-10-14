@@ -35,27 +35,38 @@ struct Target {
 std::optional<exec::Action> tactic::burst(const Obs& obs)
 {
     if (!obs.self_alive) return std::nullopt;
-    const auto& me = cambc::self();
-    if (!me.can_cast()) return std::nullopt;
+    const auto& me = turn::self();
+    if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
     // Below the pitstop line the retreat owns the turn — poke carries the
     // same guard; casting instead of recalling is how bodies get chained.
     if (obs.self_health < obs.self_max_health * 0.6f) return std::nullopt;
-    // abilities() returns its array by value — a reference into the
-    // temporary would dangle (same hazard camp_cast documents).
-    const auto abilities = me.abilities();
+    const auto& abilities = turn::abilities();
 
+    // The stun flag only feeds cc re-stun scoring — a buffs() call per
+    // enemy is wasted when no cc slot could cast anyway. A throwing
+    // info() inside this probe is swallowed: the slot loop below reaches
+    // the same throw on the same slot and aborts identically.
+    bool want_stun = false;
+    try
+    {
+        for (std::uint32_t s = 0; s < 2 && !want_stun; ++s)
+            want_stun = abilities[s].info().has_value() && abilities[s].is_cc()
+                && turn::slot_ready(s);
+    }
+    catch (...) { }
     std::vector<Target> targets;
     for (const auto& e : obs.enemies)
     {
         if (e.health <= 0) continue;
-        try
-        {
-            auto handle = cambc::vision::champion_at(e.position);
-            targets.push_back({ handle, e.position, e.health, e.gems,
-                e.submitting || handle.is_recalling(),
-                handle.buffs().has_stun(), static_cast<float>(handle.attack_range()) });
-        }
-        catch (const cambc::error&) { continue; } // left vision between collect and now
+        const auto* handle = turn::enemy_at(e.position);
+        const auto recalling = turn::enemy_recalling(e.position);
+        const auto stunned = want_stun ? turn::enemy_stunned(e.position)
+            : std::optional<bool>{ false };
+        const auto range = turn::enemy_attack_range(e.position);
+        // left vision between collect and now — a nullopt is a thrown read
+        if (!handle || !recalling || !stunned || !range) continue;
+        targets.push_back({ *handle, e.position, e.health, e.gems,
+            e.submitting || *recalling, *stunned, static_cast<float>(*range) });
     }
 
     // 1. Damage / AoE / cc on enemy champions. Every ready slot — whether
@@ -96,39 +107,31 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
             best_t = &anchor;
         }
     };
-    // damage_amount is a host call per (slot, enemy) — cache it for the
-    // turn; the 9-centre scan would otherwise re-price the same pair.
-    std::array<std::vector<float>, 2> dmg_cache{
-        std::vector<float>(targets.size(), -1.f),
-        std::vector<float>(targets.size(), -1.f) };
-    std::array<std::vector<char>, 2> dmg_bad{
-        std::vector<char>(targets.size(), 0),
-        std::vector<char>(targets.size(), 0) };
+    // damage_amount is a host call per (slot, enemy) — the turn-wide memo
+    // in turn.h is shared with gank and dedupes the 9-centre scan.
+    // -1 marks a thrown read (treated like today's catch-and-skip).
     auto dmg_of = [&](std::uint32_t slot, std::size_t i) {
-        float& cached = dmg_cache[slot][i];
-        if (cached < 0 && !dmg_bad[slot][i])
-            try { cached = abilities[slot].damage_amount(targets[i].handle); }
-            catch (const cambc::error&) { dmg_bad[slot][i] = 1; }
-        return cached;
+        const auto d = turn::damage_amount(slot, targets[i].pos);
+        return d ? *d : -1.f;
     };
     for (std::uint32_t slot = 0; slot < 2; ++slot)
     {
         const auto& ab = abilities[slot];
-        if (!ab.info() || !ab.is_ready()) continue;
+        if (!ab.info() || !turn::slot_ready(slot)) continue;
         const bool cc = ab.is_cc(), aoe = ab.is_aoe_damage();
         if (!ab.is_damage() && !cc && !aoe) continue;
-        cambc::bitboard reach{ cambc::uninitialized };
-        ab.mask_into(reach);
-        if (ab.can_target_enemies())
+        const cambc::bitboard& reach = turn::slot_reach(slot);
+        const auto targets_mask = turn::slot_targets(slot);
+        if (targets_mask.contains(cambc::ability_target_mask::enemies))
             for (std::size_t i = 0; i < targets.size(); ++i)
             {
                 const auto& t = targets[i];
                 if (!reach.is_set(t.pos)) continue;
                 const float dmg = dmg_of(slot, i);
-                if (dmg_bad[slot][i]) continue;
+                if (dmg < 0) continue;
                 consider(slot, t.pos, false, 1, dmg, t, cc && t.stunned);
             }
-        if (ab.can_target_ground() && (aoe || cc))
+        if (targets_mask.contains(cambc::ability_target_mask::ground) && (aoe || cc))
         {
             // The cc payload carries no radius — every ground cc kit ships
             // "radius one" (Ryth's area stun), so 1 is the kit constant.
@@ -151,7 +154,7 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
                                 continue;
                             ++hits;
                             all_stunned = all_stunned && e.stunned;
-                            dmg += dmg_of(slot, i);
+                            dmg += std::max(0.f, dmg_of(slot, i));
                             if (better_target(e, anchor)) anchor = &e;
                         }
                         if (hits > 0)
@@ -180,26 +183,26 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
     for (std::uint32_t slot = 0; slot < 2; ++slot)
     {
         const auto& ab = abilities[slot];
-        if (!ab.info() || !ab.is_ready() || (!ab.is_heal() && !ab.is_shield()))
+        if (!ab.info() || !turn::slot_ready(slot) || (!ab.is_heal() && !ab.is_shield()))
             continue;
-        cambc::bitboard reach{ cambc::uninitialized };
-        ab.mask_into(reach);
-        if (ab.can_target_self() && obs.self_health < obs.self_max_health * 0.7f
+        const cambc::bitboard& reach = turn::slot_reach(slot);
+        const auto targets_mask = turn::slot_targets(slot);
+        if (targets_mask.contains(cambc::ability_target_mask::self)
+            && obs.self_health < obs.self_max_health * 0.7f
             && in_danger(obs.self_pos))
             return exec::Cast{ static_cast<std::uint8_t>(slot), obs.self_pos, false };
-        if (!ab.can_target_allies()) continue;
+        if (!targets_mask.contains(cambc::ability_target_mask::allies)) continue;
         cambc::vec2 ally_pos{};
         float ally_hp = std::numeric_limits<float>::max();
-        for (const auto& ally : cambc::vision::champions(cambc::team::ally))
-            try
-            {
-                const auto p = ally.position();
-                if (p == obs.self_pos || !reach.is_set(p)) continue;
-                const float hp = ally.health();
-                if (hp >= ally.max_health() * 0.7f || !in_danger(p)) continue;
-                if (hp < ally_hp) { ally_hp = hp; ally_pos = p; }
-            }
-            catch (const cambc::error&) { continue; }
+        for (const auto& ally : turn::allies())
+        {
+            if (ally.pos == obs.self_pos || !reach.is_set(ally.pos)) continue;
+            const auto hp = turn::ally_health(ally);
+            const auto max_hp = turn::ally_max_health(ally);
+            if (!hp || !max_hp) continue;
+            if (*hp >= *max_hp * 0.7f || !in_danger(ally.pos)) continue;
+            if (*hp < ally_hp) { ally_hp = *hp; ally_pos = ally.pos; }
+        }
         if (ally_hp < std::numeric_limits<float>::max())
             return exec::Cast{ static_cast<std::uint8_t>(slot), ally_pos, false };
     }
@@ -210,15 +213,15 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
     // abilities are "walking compatible", attack allowance is separate),
     // and an enhanced reset turns the follow-up into a stun. apply()
     // performs the follow-up attack after a successful reset cast.
-    if (me.can_attack())
+    if (turn::self_state().contains(cambc::champion_state::can_attack))
     {
-        const auto attack_tiles = me.attack_tiles();
+        const auto& attack_tiles = turn::attack_tiles();
         for (const auto& t : targets)
             if (attack_tiles.is_set(t.pos))
                 for (std::uint32_t slot = 0; slot < 2; ++slot)
                 {
                     const auto& ab = abilities[slot];
-                    if (ab.info() && ab.is_ready() && ab.is_attack_reset())
+                    if (ab.info() && turn::slot_ready(slot) && ab.is_attack_reset())
                         return exec::Cast{ static_cast<std::uint8_t>(slot),
                             obs.self_pos, false };
                 }

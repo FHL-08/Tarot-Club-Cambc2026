@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 #include "../obs.h"
+#include "../turn.h"
 #include "../wire.h"
 
 namespace tactic {
@@ -24,7 +25,7 @@ struct GroupGeo {
 {
     static const std::vector<GroupGeo> cache = [] {
         std::vector<GroupGeo> out;
-        for (const auto& group : cambc::map::camp_groups())
+        for (const auto& group : turn::map_groups())
         {
             GroupGeo geo;
             group.spawn_tiles_into(geo.tiles);
@@ -52,20 +53,15 @@ struct GroupGeo {
 
 [[nodiscard]] inline const CampObs* seen_camp(const Obs& obs, int g)
 {
-    for (const auto& c : obs.camps)
-        if (c.group == g) return &c;
-    return nullptr;
+    return (g >= 0 && g < 64) ? obs.camp_at[static_cast<std::size_t>(g)] : nullptr;
 }
 
 // The same legality mask nav.cpp/exec.cpp build — tactic Moves pre-mask goal
-// tiles so distance fields only seed landable ground.
-[[nodiscard]] inline cambc::bitboard blocked_tiles()
+// tiles so distance fields only seed landable ground. Served from the
+// per-turn cache: the boards behind it can't change until apply() moves us.
+[[nodiscard]] inline const cambc::bitboard& blocked_tiles()
 {
-    auto blocked = cambc::map::walls() | cambc::map::holes() | cambc::map::altars()
-        | cambc::map::spawn_region(cambc::team::enemy) | cambc::vision::champion_tiles()
-        | cambc::vision::camp_tiles() | cambc::vision::teleport_tiles();
-    blocked.set(cambc::self().position(), false);
-    return blocked;
+    return turn::blocked_tiles();
 }
 
 // Altar index space = map::altars().positions() order — the wire byte-6
@@ -88,7 +84,7 @@ struct GroupGeo {
 [[nodiscard]] inline std::int64_t dist_to_spawn(cambc::vec2 p, cambc::team side)
 {
     std::int64_t best = std::numeric_limits<std::int64_t>::max();
-    for (const auto tile : cambc::map::spawn_region(side).positions())
+    for (const auto tile : turn::spawn_region(side).positions())
         best = std::min(best, p.chebyshev_distance(tile));
     return best;
 }

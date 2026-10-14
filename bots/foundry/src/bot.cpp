@@ -16,7 +16,7 @@ Role Bot::role() {
     try {
         const Plan plan = Plan::decode(cambc::draft_memory);
         const auto allies = cambc::champions(cambc::team::ally);
-        const auto& me = cambc::self();
+        const auto& me = turn::self();
         for (std::uint8_t slot = 0; slot < allies.size(); ++slot)
             if (allies[slot] == me) {
                 resolved = slot < plan.num_slots() ? plan.role_at(slot) : Role::FLEX;
@@ -41,8 +41,7 @@ const Plan& Bot::plan() {
 }
 
 void Bot::play_turn() {
-    auto& me = cambc::self();
-
+    auto& me = turn::self();
     // Fuel suspension commits a turn's buffered action on the resume round
     // (GameRules §fuel) — a first turn that overruns the 2× budget lands
     // its move on round 2-3 even when apply() accepted it. Round 1 nobody
@@ -51,19 +50,7 @@ void Bot::play_turn() {
     // the full collect for round 2 onward.
     Obs obs;
     try {
-        if (cambc::round_number() <= 1)
-        {
-            obs.round = cambc::round_number();
-            obs.self_pos = me.position();
-            obs.self_state = me.state();
-            obs.self_alive = me.is_alive();
-            obs.self_health = me.health();
-            obs.self_max_health = me.max_health();
-            obs.self_gems = me.gem_count();
-            obs.self_gold = me.gold_count();
-        }
-        else
-            obs = collect();
+        obs = collect();
     } catch (const std::exception&) {
         obs.round = cambc::round_number();
         obs.self_gold = me.gold_count();
@@ -84,10 +71,14 @@ void Bot::play_turn() {
     // of margin on round 1 — skip it there (starting gold buys nothing)
     // and let the init land on a later turn.
     if (me.is_alive())
+    {
         exec::apply(exec::tick(obs, plan()));
+    }
 
     if (obs.round > 1)
         econ::maybe_buy(role(), obs);
+
+    exec::warm_statics();
 
     me.set_priority(1 + random_number(100));
 }

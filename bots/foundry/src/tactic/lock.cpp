@@ -26,14 +26,14 @@ constexpr std::int64_t place_range = 2;
 
 std::optional<exec::Action> tactic::lock(const Obs& obs)
 {
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     if (me.consumables()[cambc::consumable_type::altar_lock].count() == 0)
         return std::nullopt;
 
     // Placement reads are vision-gated; only visible altars are candidates.
-    const cambc::bitboard visible = cambc::vision::visible_tiles();
+    const cambc::bitboard& visible = turn::visible_tiles();
     const auto usable = [&](cambc::vec2 altar) {
-        return visible.is_set(altar) && !cambc::vision::has_altar_lock(altar);
+        return visible.is_set(altar) && !turn::altar_locked(altar);
     };
     const auto place = [&](cambc::vec2 altar) -> exec::Action {
         alarm_altar(obs, altar_index(altar));

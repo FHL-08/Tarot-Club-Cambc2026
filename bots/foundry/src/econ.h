@@ -14,6 +14,9 @@ namespace econ {
 // invoke this even on turns where the champion cannot act otherwise.
 // Consumable policy is route-aware: a slot whose compiled route passes an
 // enemy-side altar stocks its lock ahead of shard gold (issue #24).
+// Pre-builds econ's static caches; safe anytime, idempotent.
+void warm();
+
 void maybe_buy(Role role, const Obs& obs);
 
 // True when the carried bag should be banked now: at/above the role-scaled

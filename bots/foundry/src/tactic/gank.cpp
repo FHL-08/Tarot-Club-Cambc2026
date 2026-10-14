@@ -52,7 +52,7 @@ std::int64_t loot_window(const EnemyObs& e, std::int64_t stationary)
 
 std::optional<exec::Action> tactic::gank(const Obs& obs)
 {
-    const auto& me = cambc::self();
+    const auto& me = turn::self();
     // Deliberately laxer than exec's threatened-60%: gank commits only when
     // the kill is proven lethal this window, and a dead attacker is the
     // safest exit — so the tactic yields only at exec's unconditional
@@ -87,12 +87,9 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
         }
         else
         {
-            try
-            {
-                const auto enemy = cambc::vision::champion_at(e.position);
-                if (enemy.is_recalling()) stationary = enemy.remaining_channel_time();
-            }
-            catch (const cambc::error&) { }
+            if (const auto recalling = turn::enemy_recalling(e.position); recalling && *recalling)
+                if (const auto left = turn::enemy_channel_left(e.position); left)
+                    stationary = *left;
         }
         cands.push_back({ i, loot_window(e, stationary), stationary > 0 });
     }
@@ -108,15 +105,14 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
         // Helpers: me plus every visible ally body. Ally ability cooldowns
         // are private, so allies contribute basic attacks only; an ally
         // holding a capture tile won't converge, so its share is fiction.
-        std::vector<Helper> helpers{ { obs.self_pos, me.strength(), me.attack_range() } };
-        for (const auto& ally : cambc::vision::champions(cambc::team::ally))
+        std::vector<Helper> helpers{ { obs.self_pos, turn::self_strength(), turn::self_attack_range() } };
+        for (const auto& ally : turn::allies())
         {
-            const auto pos = ally.position();
-            if (pos == obs.self_pos) continue;
-            if (const CampObs* c = seen_camp(obs, group_of(pos));
+            if (ally.pos == obs.self_pos) continue;
+            if (const CampObs* c = seen_camp(obs, group_of(ally.pos));
                 c && std::holds_alternative<cambc::map::camp_group_reward_available>(c->state))
                 continue;
-            helpers.push_back({ pos, ally.strength(), ally.attack_range() });
+            helpers.push_back({ ally.pos, ally.strength, ally.attack_range });
         }
 
         // Ready damaging/cc slots; the per-target pick below scores each by
@@ -124,12 +120,13 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
         // shorter spell that actually hurts.
         struct Spell { int slot; float range; };
         std::vector<Spell> spells;
-        auto abilities = me.abilities(); // copy of the slot views — binds live owner handles
-        if (me.can_cast())
+        const auto& abilities = turn::abilities();
+        if (turn::self_state().contains(cambc::champion_state::can_cast))
             for (std::uint32_t s = 0; s < 2; ++s)
             {
                 const auto& ab = abilities[s];
-                if (!ab.info() || !ab.is_ready() || !ab.can_target_enemies()
+                if (!ab.info() || !turn::slot_ready(s)
+                    || !turn::slot_targets(s).contains(cambc::ability_target_mask::enemies)
                     || !(ab.is_damage() || ab.is_cc()))
                     continue;
                 const float r = std::visit(
@@ -176,13 +173,9 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
                 if (obs.self_pos.chebyshev_distance(e.position)
                     > static_cast<std::int64_t>(sp.range))
                     continue;
-                try
-                {
-                    const float d = abilities[static_cast<std::uint32_t>(sp.slot)]
-                                        .damage_amount(cambc::vision::champion_at(e.position));
-                    if (d > my_spell) { my_spell = d; my_spell_slot = sp.slot; }
-                }
-                catch (const cambc::error&) { }
+                if (const auto d = turn::damage_amount(
+                        static_cast<std::uint32_t>(sp.slot), e.position))
+                    if (*d > my_spell) { my_spell = *d; my_spell_slot = sp.slot; }
             }
             total += my_spell;
             if (total < e.health) continue; // not provably lethal — pass
@@ -210,10 +203,10 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
         alarm_sighting(obs, e.position);
         const bool needed = best_others < e.health;
 
-        const cambc::bitboard attack_tiles = me.can_attack() ? me.attack_tiles() : cambc::bitboard{};
+        const cambc::bitboard attack_tiles = turn::self_state().contains(cambc::champion_state::can_attack) ? turn::attack_tiles() : cambc::bitboard{};
         if (attack_tiles.is_set(e.position))
         {
-            if (me.strength() >= e.health)
+            if (turn::self_strength() >= e.health)
             {
                 std::cout << "TACTIC gank: kill @r" << obs.round << " bag=" << e.gems << '\n';
                 return exec::Attack{ e.position, exec::Attack::Kind::champion };
@@ -237,7 +230,7 @@ std::optional<exec::Action> tactic::gank(const Obs& obs)
             // Converge: descend onto the attack ring so ranged helpers stop
             // at firing distance instead of hugging the target tile.
             cambc::bitboard ring;
-            ring.draw_chebyshev(e.position, static_cast<float>(me.attack_range()));
+            ring.draw_chebyshev(e.position, static_cast<float>(turn::self_attack_range()));
             ring &= ~blocked_tiles();
             if (ring.is_empty()) ring.set(e.position);
             std::cout << "TACTIC gank: converge @r" << obs.round << " bag=" << e.gems << '\n';
