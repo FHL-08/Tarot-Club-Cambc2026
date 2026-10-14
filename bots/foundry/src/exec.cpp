@@ -91,6 +91,21 @@ struct Mem {
     bool cast_banned[2] = { false, false };
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
+    // Cassi–Issac pair (GameRules §Cassi and Issac: either's death kills
+    // both). twin_slot widens the modulo share; follower means Cassi.
+    // Live reads on twin are vision-gated (probe: position() throws error
+    // 97 outside the reader's vision), so every use is behind try/catch.
+    std::optional<cambc::champion> twin;
+    int twin_slot = -1;
+    bool follower = false;
+    cambc::vec2 twin_last{ -1, -1 };  // last readable twin position
+    std::uint32_t twin_last_round = 0;
+    // Pair stall watchdogs: separation rounds since the twins were last
+    // adjacent; when no approach lands, the leash/follow releases so a
+    // trapped twin can't park the pair for the whole match.
+    std::int32_t pair_stall = -1;
+    std::uint32_t divorced_until = 0;
+    bool leash_on = true;
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
     // Compiled-plan binding, filled once from the draft blob. `route` is a
     // view into the Bot-held Plan — both stay valid for the whole match.
@@ -184,6 +199,25 @@ void bind_plan(const Plan& plan)
 {
     if (mem.plan_bound) return;
     mem.plan_bound = true;
+    // Pair detection is plan-independent — the modulo-share union in mine()
+    // must hold even on a blob that doesn't cover this slot.
+    const auto allies = cambc::champions(cambc::team::ally);
+    const auto& me = cambc::self();
+    for (std::size_t i = 0; i < allies.size(); ++i)
+    {
+        if (allies[i] == me) continue;
+        const auto t = allies[i].champion_name();
+        const bool me_issac = me.champion_name() == cambc::champion_type::issac;
+        const bool me_cassi = me.champion_name() == cambc::champion_type::cassi;
+        if ((me_issac && t == cambc::champion_type::cassi)
+            || (me_cassi && t == cambc::champion_type::issac))
+        {
+            mem.twin = allies[i];
+            mem.twin_slot = static_cast<int>(i);
+            mem.follower = me_cassi;
+            break;
+        }
+    }
     if (mem.slot < 0 || mem.slot >= plan.num_slots()) return;
     mem.role = plan.role_at(static_cast<std::uint8_t>(mem.slot));
     mem.bag_cap = plan.bag_cap(mem.role);
@@ -201,7 +235,11 @@ void bind_plan(const Plan& plan)
 bool mine(int g)
 {
     const int stride = std::max(1, std::min(mem.allies, static_cast<int>(groups().size())));
-    if (g >= 0 && g % stride == mem.slot % stride) return true;
+    // A paired twin works the union of both slots' modulo shares — the
+    // pair covers what two solo bodies used to.
+    if (g >= 0 && (g % stride == mem.slot % stride
+        || (mem.twin_slot >= 0 && g % stride == mem.twin_slot % stride)))
+        return true;
     if (mem.have_route)
         return g < 64 && ((mem.owned[g >> 3] >> (g & 7)) & 1);
     return false;
@@ -589,13 +627,42 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const bool shop_trip = !threat && !at_spawn
         && obs.self_gold >= shop_trip_gold && obs.self_gems <= 10
         && cambc::self().champion_name() != cambc::champion_type::tavi;
-    if (unsafe || !recovered || shop_trip)
+    // Linked fate (GameRules §Cassi and Issac): the twin dropping below
+    // the retreat floor pits both out, since one's death is the other's.
+    // A follower also homes while Issac sits at spawn — arriving paired
+    // keeps the engage order. Twin reads are vision-gated; an unreadable
+    // twin simply adds no trigger.
+    bool twin_ok = false, twin_alive = false;
+    cambc::vec2 twin_pos{};
+    float twin_health = 0, twin_max_health = 1;
+    if (mem.twin)
+    {
+        try
+        {
+            const auto& tw = *mem.twin;
+            twin_pos = tw.position();
+            twin_health = tw.health();
+            twin_max_health = tw.max_health();
+            twin_ok = true;
+            twin_alive = twin_health > 0;
+            mem.twin_last = twin_pos;
+            mem.twin_last_round = obs.round;
+        }
+        catch (const cambc::error&) { }
+    }
+    // Issac-at-spawn is deliberately NOT a follower pitstop: while readable
+    // she can reach him faster by walking than by a 5-turn recall that
+    // strands her at spawn the moment he steps out of vision. The follower
+    // branch below shadows him home instead.
+    const bool pair_pitstop = twin_ok
+        && twin_health < twin_max_health * retreat_floor;
+    if (unsafe || !recovered || shop_trip || pair_pitstop)
     {
         // fled_group prices the heal target against the pack that dealt
         // the damage — the group we're standing in, not the route
         // destination. Off the tiles (ranged ring, mid-commute) the active
         // target stays the better guess.
-        if (mem.state != State::pitstop && !shop_trip)
+        if (mem.state != State::pitstop && !shop_trip && !pair_pitstop)
             mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
                 && !threat ? (here >= 0 ? here : mem.active_target) : -1;
         // Sortie watchdog: contested exits only — an attrition bail is
@@ -695,6 +762,171 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         rings &= ~blocked;
         if (!rings.is_empty()) // every approach tile occupied: bank later
             return done(State::bank, Move{ std::move(rings) }, obs);
+    }
+
+    // Follower branch (issue #36): with Issac readable and alive, Cassi
+    // gives up her own target scan and shadows him. Camp aggro is the
+    // driver — every monster has range 3 and attacks the NEAREST champion
+    // (GameRules §Camps), so she only swings when Issac is strictly closer
+    // to each member she could reach, and otherwise kites to a tile that
+    // keeps him nearest. An unreadable twin falls through to solo logic,
+    // which still converges on the pair's shared route and union share.
+    // Leader leash: vision-gated reads mean Cassi can only follow while
+    // Issac is inside ~8 tiles, and both move one tile a round — if he
+    // advances while she's outside the leash the gap never closes. So he
+    // holds whenever she isn't within 3: unreadable either means out of
+    // vision (she's homing on his last position) or dead — and her death
+    // is his (GameRules §Cassi and Issac), so holding is never wrong. If
+    // no approach lands for ~25 rounds she is trapped (pocket geometry or
+    // a blocked ring): holding would starve the game, so the leash
+    // releases until the twins are adjacent again.
+    if (mem.twin && !mem.follower)
+    {
+        // Readable again (inside her vision range) means she can close —
+        // re-arm the leash; if she fails to close in ~25 rounds the
+        // watchdog releases it again.
+        if (twin_ok) { mem.leash_on = true; if (pos.chebyshev_distance(twin_pos) <= 2) mem.pair_stall = -1; }
+        const bool separated = !twin_alive || pos.chebyshev_distance(twin_pos) > 3;
+        if (separated && mem.leash_on)
+        {
+            if (mem.pair_stall < 0) mem.pair_stall = obs.round;
+            else if (obs.round - mem.pair_stall > 25)
+            { mem.leash_on = false; mem.pair_stall = -1; }
+            else return done(State::clear, Wait{}, obs);
+        }
+        else if (!separated) mem.pair_stall = -1;
+    }
+
+    if (mem.follower && mem.twin)
+    {
+        // Same watchdog on her side: adjacent again clears it, otherwise
+        // 25 rounds without a read/close means solo work for 60.
+        if (twin_ok && pos.chebyshev_distance(twin_pos) <= 2)
+            mem.pair_stall = -1;
+        else if (mem.pair_stall < 0)
+            mem.pair_stall = obs.round;
+        else if (obs.round - mem.pair_stall > 25)
+        { mem.divorced_until = obs.round + 60; mem.pair_stall = -1; }
+    }
+
+    if (mem.follower && mem.twin && obs.round >= mem.divorced_until)
+    {
+
+        // Twin unreadable (out of vision or dead — linked fate means her
+        // own survival tracks his): keep closing on the last readable
+        // position so the pair re-rendezvous on the shared route instead
+        // of drifting onto separate union-share camps.
+        if (!twin_alive && mem.twin_last.x >= 0
+            && pos.chebyshev_distance(mem.twin_last) > 2)
+        {
+            cambc::bitboard last{ cambc::uninitialized };
+            last.draw_chebyshev(mem.twin_last, 2);
+            last &= ~blocked;
+            if (!last.is_empty())
+                return done(State::travel, Move{ std::move(last) }, obs);
+        }
+        if (twin_alive)
+        {
+            const cambc::vec2 lp = twin_pos;
+            {
+                // Engaged group: the group owning the live member nearest
+
+                // Issac within monster range (ties to the lower index).
+                int engaged = -1;
+                std::int64_t eng_d = std::numeric_limits<std::int64_t>::max();
+                for (const auto& c : visible_camps())
+                {
+                    if (c.health() <= 0) continue;
+                    const int g = group_of(c.spawn_position());
+                    if (g < 0) continue;
+                    const auto d = c.position().chebyshev_distance(lp);
+                    if (d <= 3 && (d < eng_d || (d == eng_d && g < engaged)))
+                    { eng_d = d; engaged = g; }
+                }
+                // Stand-by tiles: free tiles within 2 of Issac plus his
+                // own tile (nav clears self from goals, so a ring-only
+                // goal set cannot represent "step onto his tile last");
+                // already inside means hold.
+                const auto shadow_or_wait = [&]() -> exec::Action {
+                    const auto d = pos.chebyshev_distance(lp);
+                    if (d <= 2) return Wait{};
+                    cambc::bitboard near2{ cambc::uninitialized };
+                    near2.draw_chebyshev(lp, 2);
+                    near2 &= ~blocked;
+                    near2.set(lp, true);
+                    return exec::Action{ Move{ std::move(near2) } };
+                };
+                if (engaged < 0)
+                {
+                    // A capturable reward beside Issac outranks shadowing —
+                    // but an ally already on its tiles owns the stand.
+                    for (std::size_t g = 0; g < geos.size(); ++g)
+                    {
+                        const CampObs* c = seen(obs, static_cast<int>(g));
+                        if (!c || !std::holds_alternative<cambc::map::camp_group_reward_available>(c->state)
+                            || dist_to(geos[g], lp) > 3)
+                            continue;
+                        auto occupied = cambc::vision::champion_tiles(cambc::team::ally)
+                            & geos[g].tiles;
+                        occupied.set(pos, false);
+                        if (!occupied.is_empty()) continue;
+                        // Standing on the group already counts toward the
+                        // capture — moving to another goal tile would reset
+                        // it (and nav clears self from goals, so a 2-tile
+                        // goal set flip-flops forever).
+                        if (geos[g].tiles.is_set(pos))
+                            return done(State::capture, Wait{}, obs);
+                        auto free_tiles = geos[g].tiles & ~blocked;
+                        if (!free_tiles.is_empty())
+                            return done(State::capture, Move{ std::move(free_tiles) }, obs);
+                    }
+                    return done(State::clear, shadow_or_wait(), obs);
+                }
+                std::vector<cambc::camp> members;
+                for (const auto& c : visible_camps())
+                    if (c.health() > 0 && group_of(c.spawn_position()) == engaged)
+                        members.push_back(c);
+                // Aggro check: monsters attack the nearest champion, so a
+                // swing is safe only while Issac is strictly nearer to
+                // every live member that could retaliate onto her.
+                bool aggro_safe = !members.empty();
+                for (const auto& m : members)
+                {
+                    const auto d_c = pos.chebyshev_distance(m.position());
+                    const auto d_l = lp.chebyshev_distance(m.position());
+                    if (d_c <= 3 && d_l >= d_c) aggro_safe = false;
+                }
+                if (aggro_safe)
+                {
+                    if (const auto cast = camp_cast(engaged, obs.round))
+                        return done(State::clear, *cast, obs);
+                    const auto attack_tiles = cambc::self().attack_tiles();
+                    if (const auto hit = attack_in_range(attack_tiles, engaged))
+                        return done(State::clear, *hit, obs);
+                }
+                // Kite window: in range of some member, strictly farther
+                // than Issac from every member, inside the 3-tile leash.
+                cambc::bitboard support{ cambc::uninitialized };
+                const auto atk_range = cambc::self().attack_range();
+                for (const auto& m : members)
+                    support.draw_chebyshev(m.position(), atk_range);
+                for (const auto& m : members)
+                {
+                    cambc::bitboard nearer{ cambc::uninitialized };
+                    nearer.draw_chebyshev(m.position(),
+                        static_cast<int>(lp.chebyshev_distance(m.position())));
+                    support &= ~nearer;
+                }
+                support &= ~blocked;
+                cambc::bitboard leash{ cambc::uninitialized };
+                leash.draw_chebyshev(lp, 3);
+                support &= leash;
+                if (support.is_set(pos)) return done(State::clear, Wait{}, obs);
+                if (!support.is_empty())
+                    return done(State::clear, Move{ std::move(support) }, obs);
+                return done(State::clear, shadow_or_wait(), obs);
+            }
+        }
     }
 
     // Route step. With a compiled route: cyclic scan from the cursor — the
