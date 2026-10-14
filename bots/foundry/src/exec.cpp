@@ -1227,22 +1227,47 @@ bool exec::apply(const Action& action)
             else if constexpr (std::is_same_v<T, Cast>)
             {
                 if (!me.can_cast() || a.slot >= 2) return false;
+                const auto abilities = me.abilities();
                 if (a.ground)
                 {
                     // A stale or out-of-range ground tile throws; treat it
                     // like any other fizzled action, not a faulted turn.
-                    try { return me.abilities()[a.slot].use(a.target); }
+                    try { return abilities[a.slot].use(a.target); }
                     catch (const cambc::error&) { return false; }
                 }
                 try
                 {
-                    return me.abilities()[a.slot].use(cambc::vision::champion_at(a.target));
+                    if (!abilities[a.slot].use(cambc::vision::champion_at(a.target)))
+                        return false;
                 }
                 catch (const cambc::error&)
                 {
-                    try { return me.abilities()[a.slot].use(cambc::vision::camp_at(a.target)); }
+                    try { return abilities[a.slot].use(cambc::vision::camp_at(a.target)); }
                     catch (const cambc::error&) { return false; }
                 }
+                // An attack-reset cast restores the attack allowance it
+                // didn't consume (GameRules §Combat) — spend it on the
+                // lowest-health enemy still in range.
+                if (abilities[a.slot].is_attack_reset() && me.can_attack())
+                {
+                    const auto attack_tiles = me.attack_tiles();
+                    cambc::vec2 hit{};
+                    float hit_hp = std::numeric_limits<float>::max();
+                    for (const auto& e : visible_enemies())
+                        try
+                        {
+                            if (!e.is_visible() || !attack_tiles.is_set(e.position())) continue;
+                            const float hp = e.health();
+                            if (hp > 0 && hp < hit_hp) { hit_hp = hp; hit = e.position(); }
+                        }
+                        catch (const cambc::error&) { continue; } // stale entity — skip this turn
+                    if (hit_hp < std::numeric_limits<float>::max())
+                    {
+                        try { me.attack(cambc::vision::champion_at(hit)); }
+                        catch (const cambc::error&) { }
+                    }
+                }
+                return true;
             }
             else if constexpr (std::is_same_v<T, Channel>)
             {

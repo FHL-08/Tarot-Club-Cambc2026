@@ -2,7 +2,8 @@
 // Interdiction hook — docs/strategy.md §RUNTIME "tactic/: evaluated before
 // the route step". Each module gets first refusal on the turn in dispatch
 // order — peel (channel saves) > gank (bag theft) > lock (altar denial) >
-// deny (sabotage) > poke (spend the free attack) — matching the strategy
+// burst (ability spend on champions) > deny (sabotage) > poke (spend the
+// free attack) — matching the strategy
 // doc's priority ("throughput first, denial second"). Returning an Action
 // takes the turn; std::nullopt passes control down the chain and finally
 // to the route step.
@@ -23,6 +24,7 @@ namespace tactic {
 [[nodiscard]] std::optional<exec::Action> peel(const Obs& obs);
 [[nodiscard]] std::optional<exec::Action> gank(const Obs& obs);
 [[nodiscard]] std::optional<exec::Action> lock(const Obs& obs);
+[[nodiscard]] std::optional<exec::Action> burst(const Obs& obs);
 [[nodiscard]] std::optional<exec::Action> deny(const Obs& obs);
 [[nodiscard]] std::optional<exec::Action> poke(const Obs& obs);
 
