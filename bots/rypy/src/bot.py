@@ -107,17 +107,30 @@ def farm_camps():
             if attack_if_in_range(camp):
                 return
 
+# Champion-specific stat upgrades.
+STAT_UPGRADES = {
+    cambc.ChampionType.RYTH: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.VESPER_VALE: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.VENDETTA: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.CASSI: Item.POWER_SHARD_OF_FOCUS,
+    cambc.ChampionType.ISSAC: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.STELLAR: Item.POWER_SHARD_OF_FOCUS,
+    cambc.ChampionType.PRISM: Item.POWER_SHARD_OF_FOCUS,
+    cambc.ChampionType.MARCELLA: Item.POWER_SHARD_OF_FOCUS,
+    cambc.ChampionType.WILLOW: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.REN: Item.POWER_SHARD_OF_FOCUS,
+    cambc.ChampionType.VARG: Item.POWER_SHARD_OF_STRENGTH,
+    cambc.ChampionType.TAVI: Item.POWER_SHARD_OF_FOCUS,
+}
+
 
 class Bot:
-    def __init__(self):
-        self.chosen_stat = None
-
     def buy_items(self):
         me = cambc.me()
 
-        # Focus upgrades on damage. Confirm the stat's in-game scaling
-        # before switching to Focus for a champion with spell-heavy damage.
-        item = Item.POWER_SHARD_OF_STRENGTH
+        champion = me.champion_name()
+        item = STAT_UPGRADES[champion]
+
         count = me.gold_count() // item.cost()
 
         if count > 0 and me.can_buy(item, count):
