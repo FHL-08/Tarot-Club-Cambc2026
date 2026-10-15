@@ -629,7 +629,11 @@ bool focus_turn(std::uint32_t round)
 // would-be Wait on work — poke any owned monster in reach, else drift to
 // the nearest objective's free tiles (group tiles first so a parked
 // capture keeps cooking, then its ring). Nothing left means yield anyway.
-std::optional<exec::Action> drift_action(const Obs& obs)
+// park_hold (v3 park mode): a group believed respawning is approached on
+// its ring — standing on the spawn tiles themselves stalls the respawn
+// the park is waiting on (GameRules: an occupied spawn tile delays the
+// whole group).
+std::optional<exec::Action> drift_action(const Obs& obs, bool park_hold = false)
 {
     const auto& geos = groups();
     if (const auto hit = attack_in_range(turn::attack_tiles(), -1, false))
@@ -648,8 +652,19 @@ std::optional<exec::Action> drift_action(const Obs& obs)
         }
     }
     if (g < 0) return std::nullopt;
-    auto goals = geos[g].tiles & ~blocked_tiles();
-    goals.set(pos, false);
+    cambc::bitboard goals;
+    if (park_hold && ledger::ready_round(g) > static_cast<std::int32_t>(obs.round))
+    {
+        for (const auto tile : geos[g].tile_list) goals.draw_chebyshev(tile, 1);
+        goals &= ~geos[g].tiles;
+        goals &= ~blocked_tiles();
+        goals.set(pos, false);
+    }
+    else
+    {
+        goals = geos[g].tiles & ~blocked_tiles();
+        goals.set(pos, false);
+    }
     if (goals.is_empty())
     {
         for (const auto tile : geos[g].tile_list) goals.draw_chebyshev(tile, 1);
@@ -701,14 +716,12 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
     return action;
 }
 
-// Heavy-wait cadence (issue #93): mite yields most turns no action
-// applies — a repositioning Move lands only every yield_mod'th turn.
+// v3 park mode (issue #93): yields are positional — they happen inside
+// the assigned group's footprint, never in transit — so every reposition
+// goal emits a real Move. The name survives from v2's wait-or-move
+// cadence, now retired.
 exec::Action wait_or_move(State next, cambc::bitboard goals, const Obs& obs)
 {
-    if (clone::yield_mode == clone::YieldMode::heavy
-        && (obs.round + static_cast<std::uint32_t>(my_slot()))
-            % static_cast<std::uint32_t>(clone::yield_mod) != 0)
-        return done(next, exec::Wait{}, obs);
     return done(next, exec::Move{ std::move(goals) }, obs);
 }
 
@@ -1424,13 +1437,22 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             mem.nav_pending = haul;
             return wait_or_move(State::haul, std::move(ring), obs);
         }
-        // respawn_wait (hello): parked yields are only for a respawn inside
-        // ~8 rounds — further out the body works instead of sitting.
+        // park (issue #93 v3): the yield is positional — emitted only on
+        // the group's ring inside the respawn_wait_rounds window, and only
+        // while no enemy champion sits within ~5 tiles (a close enemy
+        // means fight/flee, handled by the normal guards). Beyond the
+        // window the body works: drift, keeping off the respawning tiles.
+        const bool parked_eta = haul_ready - static_cast<std::int32_t>(obs.round)
+            <= clone::respawn_wait_rounds;
+        bool enemy_near = false;
+        for (const auto& e : obs.enemies)
+            if (e.health > 0 && pos.chebyshev_distance(e.position) <= 5)
+            { enemy_near = true; break; }
         if (clone::yield_mode == clone::YieldMode::never
-            || (clone::yield_mode == clone::YieldMode::respawn_wait
-                && haul_ready - static_cast<std::int32_t>(obs.round)
-                    > clone::respawn_wait_rounds))
-            if (const auto drift = drift_action(obs))
+            || (clone::yield_mode == clone::YieldMode::park
+                && (!parked_eta || enemy_near)))
+            if (const auto drift = drift_action(obs,
+                    clone::yield_mode == clone::YieldMode::park))
                 return done(State::haul, *drift, obs);
         return done(State::haul, Wait{}, obs);
     }
@@ -1450,9 +1472,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // be proven by vision: an unseen group may be enemy-held, so a ledger
     // belief alone never flags. Unreachable and unsoloable groups are
     // legitimately idle.
-    if (clone::yield_mode == clone::YieldMode::never)
-        if (const auto drift = drift_action(obs))
-            return done(State::idle, *drift, obs);
+    // Idle work for never and park alike — park yields only inside the
+    // footprint (the haul block above), so an idle body drifts instead.
+    if (const auto drift = drift_action(obs,
+            clone::yield_mode == clone::YieldMode::park))
+        return done(State::idle, *drift, obs);
     return done(State::idle, Wait{}, obs);
     } catch (const std::exception& err)
     {

@@ -29,14 +29,14 @@ inline constexpr std::uint32_t trib_cap = 44;
 // land on champions. Targeting is nearest-in-range; lowest-hp% was a v1
 // misread (median attacked-target hp% ~0.5-0.6).
 inline constexpr int champ_focus_n = 11;
-// Wait signature (issue #93): never = always take an action, drifting to
-// the nearest objective when idle; respawn_wait = yield only while a camp
-// respawn sits within respawn_wait_rounds; heavy = yield most no-action
-// turns (every yield_mod'th reposition still moves).
-enum class YieldMode : std::uint8_t { never, respawn_wait, heavy };
-inline constexpr YieldMode yield_mode = YieldMode::heavy;
-inline constexpr int yield_mod = 3;
-inline constexpr int respawn_wait_rounds = 8;
+// Wait signature (issue #93 v3): never = always take an action, drifting
+// to the nearest objective when idle; park = hold on the assigned group's
+// ring and yield only while its respawn sits within respawn_wait_rounds
+// and no enemy champion is inside ~5 tiles — yields land inside the camp
+// footprint, never in transit.
+enum class YieldMode : std::uint8_t { never, park };
+inline constexpr YieldMode yield_mode = YieldMode::park;
+inline constexpr int respawn_wait_rounds = 20;
 // Nav orders (issue #93): true = re-path on any objective change (hello's
 // measured ~4x rate); false = re-path only when the target invalidates.
 inline constexpr bool nav_repath_on_change = false;
