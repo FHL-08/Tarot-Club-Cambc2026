@@ -4,7 +4,7 @@
 #include <array>
 #include <optional>
 
-// Two squads farm gems: A = Ryth (tank, leads) + Tavi + Stellar,
+// Two squads farm gems: A = Ryth (tank, leads) + Tavi + Willow,
 // B = Issac (leads) + Cassi + Prism. They fight enemy champions in sight unless clearly outmatched.
 enum class Role { tank, fighter, marksman, support, mage, farmer };
 

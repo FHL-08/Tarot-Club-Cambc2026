@@ -29,13 +29,14 @@ int soloable_groups() {
 void play_draft() {
     // Fixed lineup: the first team_size() entries, in this order, and nothing else.
     // Cassi & Issac is one pick that gives two champions.
-    // 3: Ryth, Cassi & Issac, Stellar   4: + Tavi   5: + Varg (solo farmer) or Prism
-    // (Stellar before Tavi tested better overnight: 316 vs 313 of 340 league games.)
+    // 3: Ryth, Cassi & Issac, Willow   4: + Tavi   5: + Varg (solo farmer) or Prism
+    // Willow is the top-5 comp's support half; Tavi stays for the ranged
+    // backbone — dropping both dealers collapsed champDmg ~40% (#113).
     using cambc::champion_draft;
     const auto size = std::min<std::size_t>(cambc::draft::team_size(), 5);
     const auto fifth = size >= 5 && soloable_groups() >= 4 ? champion_draft::varg : champion_draft::prism;
     const std::array lineup{champion_draft::ryth, champion_draft::cassi_and_issac,
-        champion_draft::stellar, champion_draft::tavi, fifth};
+        champion_draft::willow, champion_draft::tavi, fifth};
 
     const auto chosen = cambc::draft::current_draft(cambc::team::ally);
     for (std::size_t i = 0; i < size; ++i)

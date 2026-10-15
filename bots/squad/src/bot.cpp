@@ -1130,7 +1130,7 @@ Context read_context(bool squad_a) {
 void Bot::init() {
     initialised = true;
     auto& me = cambc::self();
-    // Squad A: Ryth (leads), Tavi, Stellar. Squad B: Issac (leads), Cassi, Prism.
+    // Squad A: Ryth (leads), Tavi, Willow. Squad B: Issac (leads), Cassi, Prism.
     using T = cambc::champion_type;
     switch (me.champion_name()) {
     case T::ryth: role = Role::tank; squad_a = true; break;
