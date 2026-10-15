@@ -94,4 +94,44 @@ bool step_towards(cambc::vec2 target)
     return step(goals);
 }
 
+std::optional<cambc::vec2> best_dash(const cambc::bitboard& goals,
+    const cambc::bitboard& reach)
+{
+    const auto& me = turn::self();
+    auto goals_clean = goals;
+    goals_clean.set(me.position(), false);
+    if (!me.can_move() || goals_clean.is_empty())
+        return std::nullopt;
+
+    const auto blocked = turn::blocked_tiles();
+    cambc::bitboard self_tile;
+    self_tile.set(me.position());
+    cambc::distance_field field;
+    cambc::bitboard visited;
+    field.compute_to(blocked & ~goals_clean, goals_clean, self_tile, visited);
+
+    // The walk baseline: best field value over every tile a move reaches,
+    // including standing still — a dash must beat all of them to pay.
+    const auto speed = static_cast<std::uint16_t>(me.base_stats().base_move_speed);
+    auto best = field.get(me.position());
+    for (const auto tile : blocked.reachable_tiles(me.position(), speed).positions())
+        best = std::min(best, field.get(tile));
+
+    // Legal landing tiles only — holes/walls/occupants are masked out.
+    // A hidden occupant fizzles into the strike watchdog like any other
+    // cast, and one cooldown later the slot retries (issue #93).
+    const auto dest_mask = reach & ~blocked;
+    std::optional<cambc::vec2> dest;
+    for (const auto tile : dest_mask.positions())
+        // A tie still pays: the dash is movement-compatible, so landing on
+        // an equal-distance tile costs no arrival and spends the slot on
+        // cooldown the way the measured teams run it (issue #93).
+        if (field.get(tile) <= best)
+        {
+            best = field.get(tile);
+            dest = tile;
+        }
+    return dest;
+}
+
 } // namespace nav

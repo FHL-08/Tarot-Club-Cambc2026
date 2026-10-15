@@ -73,6 +73,11 @@ struct Obs {
     obs.self_alive = me.is_alive();
     obs.self_gems = me.gem_count();
     obs.self_gold = me.gold_count();
+    // Round 1 nobody is visible from spawn: the enemy/camp/wire scans
+    // (~64k fuel) would read empty vectors anyway, and a suspended first
+    // turn lands its buffered move a round late (GameRules §fuel). The
+    // full scan set starts on round 2.
+    if (obs.round <= 1) return obs;
     for (const auto& enemy : cambc::vision::champions(cambc::team::enemy))
     {
         EnemyObs seen;
