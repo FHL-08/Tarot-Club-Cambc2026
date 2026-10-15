@@ -8,6 +8,7 @@
 #include "obs.h"
 #include "plan.h"
 #include "random.h"
+#include "warding.h"
 #include <cstdint>
 
 Role Bot::role() {
@@ -81,4 +82,8 @@ void Bot::play_turn() {
     exec::warm_statics();
 
     me.set_priority(1 + random_number(100));
+
+    // Optional trinket work happens after every normal action. It cannot
+    // redirect this champion's farming path or delay a carried-gem deposit.
+    warding::maybe_place(obs);
 }
