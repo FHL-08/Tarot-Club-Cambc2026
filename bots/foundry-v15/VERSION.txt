@@ -1,0 +1,10 @@
+version: foundry-v15 (submission candidate)
+config: hello policy — clone_config.h from bots/clones/hello-clone
+chassis: foundry v14 (bots/foundry/src copy + clone_config.h)
+source: issue #84 replay study — ~3,300 decoded games; per-map draft comp,
+  attack-on-sight + ~3-turn chase, recall_hp 0.46, tribute cap 44,
+  measured itemisation order, ward placement on travel turns
+evidence: local_eval vs foundry (v14+warding+camp-scoring) 13-5 (won 7-2 as
+  B side, 6-3 as A side); skeleton fidelity 0.85 vs hello's decoded replays;
+  botFaults [0,0]
+accuracy: skeleton predicts clone actions 0.847-0.854 (held-out maps)
