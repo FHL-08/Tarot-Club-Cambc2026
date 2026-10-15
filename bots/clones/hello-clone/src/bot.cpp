@@ -39,8 +39,9 @@ void clone_ward(const Obs& obs, const exec::Action& action, std::uint8_t& placed
         for (const auto t : tiles.positions())
             if (const auto d = t.chebyshev_distance(toward); d < best_d)
             { best_d = d; best = t; }
-        me.place_ward(best);
-        ++placed;
+        // A failed attempt (hidden occupant) still throttles via `last`,
+        // but only a placed ward consumes the per-champion quota.
+        if (me.place_ward(best)) ++placed;
         last = obs.round;
         std::cout << "WARD r" << obs.round << " @" << best.x << ',' << best.y << '\n';
     }

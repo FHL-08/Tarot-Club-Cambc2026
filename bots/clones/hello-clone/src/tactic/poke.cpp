@@ -14,13 +14,12 @@ std::optional<exec::Action> tactic::poke(const Obs& obs)
     const EnemyObs* best = nullptr;
     for (const auto& e : obs.enemies)
     {
-        if (e.health <= 0 || !attack_tiles.is_set(e.position)) continue;
-        // A mid-tribute enemy is pinned at the altar: ordinary damage does
-        // NOT cancel the channel (GameRules §Channels — only stun, death or
-        // an altar lock does), but the free hit softens the bag carrier
-        // for a gank. Otherwise lowest health = fastest kill.
-        const bool better = !best || (e.submitting && !best->submitting)
-            || (e.submitting == best->submitting && e.health < best->health);
+        if (e.health <= 0 || e.max_health <= 0 || !attack_tiles.is_set(e.position)) continue;
+        // Measured policy (issue #84): the lowest health fraction in the
+        // ring takes the hit. Absolute health would let a fresh tank body
+        // screen a wounded carry.
+        const bool better = !best
+            || e.health / e.max_health < best->health / best->max_health;
         if (better) best = &e;
     }
     if (!best) return std::nullopt;
