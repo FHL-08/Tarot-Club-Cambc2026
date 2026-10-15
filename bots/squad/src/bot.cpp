@@ -11,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -89,6 +90,16 @@ float health_pct(const cambc::unit& u) {
     }
 }
 
+// A stunned body outranks damage threat: converging on the target a
+// teammate already disabled is what makes the kill chain emerge.
+bool stunned(const cambc::champion& e) {
+    try {
+        return e.buffs().has_stun();
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // A unit killed (or gone out of sight) earlier this turn throws on every read;
 // an uncaught throw costs the champion the rest of its turn. These helpers
 // read safely.
@@ -164,17 +175,21 @@ float threat(const cambc::champion& e) {
 }
 
 // Greatest damage threat, optionally only among enemies within max_range of us.
+// prefer_stunned is for the in-range hit pick: a stunned body outranks
+// threat, but the bonus must not pull approaches across the map.
 std::optional<cambc::champion> top_threat(const std::vector<cambc::champion>& enemies,
-                                          int max_range = 1000) {
+                                          int max_range = 1000, bool prefer_stunned = false) {
     const auto me = cambc::self().position();
     std::optional<cambc::champion> best;
     float best_threat = -1;
+    bool best_stunned = false;
     for (const auto& e : enemies) {
         if (!alive(e) || dist(me, safe_pos(e, vec2{-1000, -1000})) > max_range)
             continue;
         const float t = threat(e);
-        if (!best || t > best_threat)
-            best = e, best_threat = t;
+        const bool s = prefer_stunned && stunned(e);
+        if (!best || (s && !best_stunned) || (s == best_stunned && t > best_threat))
+            best = e, best_threat = t, best_stunned = s;
     }
     return best;
 }
@@ -260,6 +275,30 @@ std::pair<std::optional<vec2>, int> best_area_tile(const cambc::ability* a,
     return {best, best_hits};
 }
 
+// Cast a ready disable on a committed target before the basic hit lands:
+// chained stuns win the trade that a string of basics never does. A target
+// already stunned makes the cast a waste, so the hit goes through instead;
+// a landed disable still leaves this turn's attack allowance free.
+bool disable_first(const cambc::champion& target) {
+    auto& me = cambc::self();
+    if (!me.can_cast() || stunned(target))
+        return false;
+    const auto at = safe_pos(target, me.position());
+    const auto abilities = me.abilities();
+    for (const auto& a : abilities) {
+        try {
+            if (!a.is_cc() || !a.is_ready() || !a.valid_tiles().is_set(at))
+                continue;
+            if (a.can_target_ground() && !a.can_target_enemies())
+                return attempt([&] { return a.use(at); });
+            if (a.can_target_enemies())
+                return attempt([&] { return a.use(target); });
+        } catch (const std::exception&) {
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- burst
 // mingstudy-ttsburst: port of ming_bot tactic/burst.cpp part 1. Whenever a
 // ready damage / area / stun spell can reach an enemy champion (not one healing
@@ -312,6 +351,8 @@ bool burst() {
             return true;
         if (a.channel != b->channel)
             return a.channel;
+        if (a.stunned != b->stunned)
+            return a.stunned;
         if (a.hp != b->hp)
             return a.hp < b->hp;
         return a.gems > b->gems;
@@ -434,9 +475,12 @@ bool attack_lock(const cambc::altar_lock& lock) {
     });
 }
 
-// Attack, then use an attack reset (if one is ready) to attack again.
+// Attack, then use an attack reset (if one is ready) to attack again. A
+// committed champion target eats a ready disable first (see disable_first).
 template<class Target>
 bool attack_with_reset(const Target& target, const cambc::ability* reset) {
+    if constexpr (std::is_same_v<Target, cambc::champion>)
+        disable_first(target);
     if (!basic_attack(target))
         return false;
     if (cast_self(reset) && !basic_attack(target))
@@ -446,10 +490,11 @@ bool attack_with_reset(const Target& target, const cambc::ability* reset) {
     return true;
 }
 
-// Basic-attack the greatest threat in range, or any enemy in range.
+// Basic-attack the greatest threat in range; a stunned enemy in reach
+// outranks it — that is the disable-follow-up kill chain.
 bool attack_enemies(const std::vector<cambc::champion>& enemies, const cambc::ability* reset) {
     auto& me = cambc::self();
-    if (auto t = top_threat(enemies, me.attack_range()))
+    if (auto t = top_threat(enemies, me.attack_range(), true))
         return attack_with_reset(*t, reset);
     return false;
 }
@@ -953,6 +998,52 @@ void fall_back() {
     step_towards(cambc::map::spawn_region(team::ally));
 }
 
+// Bodies packed inside Chebyshev 2 of self (self counts): at 3+, a single
+// radius-1 area disable centred between them covers the whole clump.
+int clump_count(const std::vector<cambc::champion>& allies) {
+    const auto here = cambc::self().position();
+    int n = 1;
+    for (const auto& a : allies)
+        n += dist(safe_pos(a, vec2{-1000, -1000}), here) <= 2;
+    return n;
+}
+
+// The tiles in `band` spaced at least 3 from every ally and 2 from every
+// enemy — out of one area disable's cover.
+bitboard spread_tiles(const std::vector<cambc::champion>& allies,
+                      const std::vector<cambc::champion>& enemies, const bitboard& band) {
+    bitboard open;
+    open.clear();
+    for (const auto t : band.positions()) {
+        bool ok = true;
+        for (const auto& a : allies)
+            if (dist(t, safe_pos(a, vec2{-1000, -1000})) < 3) {
+                ok = false;
+                break;
+            }
+        if (ok)
+            for (const auto& e : enemies)
+                if (dist(t, safe_pos(e, vec2{-1000, -1000})) < 2) {
+                    ok = false;
+                    break;
+                }
+        if (ok)
+            open.set(t);
+    }
+    return open;
+}
+
+// Non-melee fight shape: a clumped back line orbits to a tile in its usual
+// band that keeps every body at least 3 apart, instead of stacking on the
+// same approach tile.
+bool spread(const Context& ctx, vec2 target, int lo, int hi) {
+    if (cambc::self().attack_range() <= 1 || clump_count(ctx.allies) < 3)
+        return false;
+    const auto open = spread_tiles(ctx.allies, ctx.enemies, ring(target, lo, hi))
+        & ~blocked_tiles();
+    return !open.is_empty() && step_towards(open);
+}
+
 // Squad A follows Ryth's position; squad B follows the objective its leader shares.
 Context read_context(bool squad_a) {
     Context ctx;
@@ -1087,6 +1178,28 @@ bool Bot::survive() {
     // Otherwise run home; recall only once out of reach.
     step_towards(cambc::map::spawn_region(team::ally));
     return true;
+}
+
+// Bail on disable: once any body in a packed clump is seen stunned, the
+// blob is one area disable from a wipe — step out of it, then let the turn
+// continue (a melee champ can still swing after the step). A self-stun is
+// remembered for one turn (was_stunned), since it cannot move that turn.
+void Bot::bail_from_clump(bool stun_seen) {
+    const auto here = cambc::self().position();
+    const auto enemies = visible_enemies();
+    if (nearest_enemy_distance(enemies, here) > 4)
+        return;
+    const auto allies = visible_allies();
+    int clumped = 1;
+    for (const auto& a : allies) {
+        if (dist(safe_pos(a, vec2{-1000, -1000}), here) > 2)
+            continue;
+        ++clumped;
+        stun_seen = stun_seen || stunned(a);
+    }
+    if (clumped < 3 || !stun_seen)
+        return;
+    step_towards(spread_tiles(allies, enemies, square(here, 2)) & ~blocked_tiles());
 }
 
 // Carried gems are banked straight away (tested best: carrying gems loses them).
@@ -1465,6 +1578,7 @@ void Bot::play_turn() {
     scout(reporter);
 
     if (!me.is_alive()) { // dead champions can still shop
+        was_stunned = false;
         shop();
         return;
     }
@@ -1475,6 +1589,12 @@ void Bot::play_turn() {
         team_memory::set_anchor(me.position(), hunting);
     if (me.is_recalling() || me.is_submitting_gems() || me.is_teleporting())
         return;
+
+    // A stun strips every allowance, so it only ever shows after the fact:
+    // remember it one turn for the bail check before the role turn.
+    const bool self_stunned = !me.can_move() && !me.can_attack() && !me.can_cast();
+    const bool stun_seen = self_stunned || was_stunned;
+    was_stunned = self_stunned;
 
     shop();
     if (survive())
@@ -1490,6 +1610,8 @@ void Bot::play_turn() {
         return;
     peel();
     place_lock();
+
+    bail_from_clump(stun_seen);
 
     switch (role) {
     case Role::tank: tank_turn(); break;
@@ -1620,8 +1742,11 @@ void Bot::marksman_turn() {
             cast_on(stun, *target);
         if (attack_enemies(ctx.enemies, reset))
             return;
-        if (target)
-            keep_distance(safe_pos(*target, me.position()), 3, 3);
+        if (target) {
+            const auto at = safe_pos(*target, me.position());
+            if (!spread(ctx, at, 2, 3))
+                keep_distance(at, 3, 3);
+        }
         return;
     }
 
@@ -1686,6 +1811,9 @@ void Bot::support_turn() {
     if (engage) {
         if (attack_enemies(ctx.enemies, attack_reset))
             return;
+        if (const auto threat_target = top_threat(ctx.enemies))
+            if (spread(ctx, safe_pos(*threat_target, me.position()), 2, 3))
+                return;
         // Back line: near Ryth (or the team) but at least 4 tiles from enemies.
         const vec2 centre = ctx.anchor ? *ctx.anchor
             : (ctx.allies.empty() ? me.position() : ctx.allies.front().position());
@@ -1758,8 +1886,11 @@ void Bot::mage_turn() {
         }
         if (attack_enemies(ctx.enemies, nullptr))
             return;
-        if (const auto target = top_threat(ctx.enemies))
-            keep_distance(safe_pos(*target, me.position()), 2, 4);
+        if (const auto target = top_threat(ctx.enemies)) {
+            const auto at = safe_pos(*target, me.position());
+            if (!spread(ctx, at, 2, 4))
+                keep_distance(at, 2, 4);
+        }
         return;
     }
 
