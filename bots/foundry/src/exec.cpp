@@ -62,6 +62,12 @@ constexpr std::uint32_t strike_cooldown = 200;
 constexpr float retreat_floor = 0.55f;
 constexpr std::int64_t opportunity_range = 6;
 
+// A group believed dead-and-unscheduled (ledger::never) earns a
+// re-inspection walk once it has been out of this body's vision this many
+// rounds — the enemy may have captured or fought it since (ming-v12's
+// stale_reward).
+constexpr std::int32_t stale_rounds = 24;
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -79,6 +85,9 @@ struct Mem {
     // input; hp < 0 means never seen alive this match.
     struct CampLeft { float hp = -1.0f, dps = 0.0f; std::int32_t round = -1; };
     std::vector<CampLeft> camp_left;
+    // Last round each group appeared in this body's own vision (-1 = never).
+    // obs.camps is per-body, so the stale-reward clock is too.
+    std::vector<std::int32_t> camp_seen;
     // Cast-fizzle watchdog: a use() that throws never starts the cooldown,
     // so `is_ready` stays true and the naive loop would re-emit the same
     // fizzling cast every turn. Three consecutive strikes retire the slot.
@@ -926,13 +935,18 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
     if (mem.strikes.size() != geos.size()) mem.strikes.assign(geos.size(), 0);
     if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
+    if (mem.camp_seen.size() != geos.size()) mem.camp_seen.assign(geos.size(), -1);
     // A group seen dead clears its strike history: someone ground it down
     // this life, so prior failed sorties no longer evidence a trap.
     for (const auto& c : obs.camps)
+    {
+        if (c.group < mem.camp_seen.size())
+            mem.camp_seen[c.group] = static_cast<std::int32_t>(obs.round);
         if (c.group < mem.strikes.size()
             && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
                 || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
             mem.strikes[c.group] = 0;
+    }
     // Snapshot live member hp/dps sums — rebuilt each round from the
     // members currently in vision, so an edge-of-vision sighting
     // overwrites a fuller read with the subset sum and heal_target
@@ -1461,12 +1475,20 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             || (unfit(geos[g], obs.self_max_health) && !desperate))
             continue;
         const std::int32_t ready = ledger::ready_round(static_cast<int>(g));
-        if (ready == ledger::never) continue;
+        // A never-scheduled group still claims a slot once unobserved for
+        // stale_rounds — priced as ready now, so the nearest overdue camp
+        // draws the walk that brings it back into vision.
+        if (ready == ledger::never
+            && (mem.camp_seen[g] < 0
+                || static_cast<std::int32_t>(obs.round) - mem.camp_seen[g] < stale_rounds))
+            continue;
         const auto d = dist_to(geos[g], pos);
-        if (haul < 0 || ready < haul_ready || (ready == haul_ready && d < haul_dist))
+        const std::int32_t eff = ready == ledger::never
+            ? static_cast<std::int32_t>(obs.round) : ready;
+        if (haul < 0 || eff < haul_ready || (eff == haul_ready && d < haul_dist))
         {
             haul = static_cast<int>(g);
-            haul_ready = ready;
+            haul_ready = eff;
             haul_dist = d;
         }
     }
