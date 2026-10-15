@@ -80,7 +80,6 @@ void warding::maybe_place(const Obs& obs)
             if (distance < nearest) { nearest = distance; target = anchor; }
         }
         if (nearest == 9) return;
-        next_check_round = obs.round + 16;
 
         const auto passable = ~(cambc::map::walls() | cambc::map::holes()
             | cambc::map::altars());
@@ -90,6 +89,7 @@ void warding::maybe_place(const Obs& obs)
         approach &= passable;
         const auto bush_approach = cambc::map::bushes() & approach;
         const auto unseen_approach = approach & ~turn::visible_tiles();
+        const auto bush_unseen = bush_approach & ~turn::visible_tiles();
         // blocked_tiles additionally masks occupied tiles, so a placement
         // that would fail on a visible body never reaches the engine.
         const auto legal = me.ward_placement_tiles() & ~turn::blocked_tiles();
@@ -107,13 +107,14 @@ void warding::maybe_place(const Obs& obs)
             return a.tile.x < b.tile.x;
         });
 
-        // Replacing an existing ward loses its old vision. Never downgrade
-        // coverage of the current approach for the swap.
+        // Replacing an existing ward loses its old vision. Compare wards on
+        // the approach tiles a body can't already see — counting shared sight
+        // would let a swap trade away tiles only the old ward covered.
         std::uint32_t old_score = 0;
         const auto existing = me.ward_positions();
         if (!existing.empty())
             old_score = coverage_score(cambc::ward::visible_tiles_from(existing.front()),
-                approach, bush_approach);
+                unseen_approach, bush_unseen);
 
         std::uint32_t best_score = 0, best_new = 0;
         cambc::vec2 best_tile{};
@@ -121,7 +122,7 @@ void warding::maybe_place(const Obs& obs)
         const std::size_t limit = std::min<std::size_t>(5, candidates.size());
         for (std::size_t i = 0; i < limit && cambc::fuel_remaining() >= 24000; ++i) {
             const auto footprint = cambc::ward::visible_tiles_from(candidates[i].tile);
-            const auto score = coverage_score(footprint, approach, bush_approach);
+            const auto score = coverage_score(footprint, unseen_approach, bush_unseen);
             const auto newly_seen = (footprint & unseen_approach).count();
             if (newly_seen >= 4 && score >= old_score
                 && (!found || score > best_score)) {
@@ -131,6 +132,9 @@ void warding::maybe_place(const Obs& obs)
                 best_tile = candidates[i].tile;
             }
         }
+        // A failed check retries soon instead of locking out the next approach;
+        // a placed ward earns the full cooldown before the next assessment.
+        next_check_round = obs.round + (found ? 16 : 8);
         if (!found || cambc::fuel_remaining() < 10000) return;
 
         // Placing a ward is an optional trinket action. A hidden obstruction
