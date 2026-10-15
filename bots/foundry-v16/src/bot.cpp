@@ -66,6 +66,13 @@ void Bot::play_turn() {
         std::cout << "LEDGER_ERR " << err.what() << '\n';
     }
 
+    // Pre-action observation (v17 observe_turn): dead and channelling
+    // bodies still see alive/dead camp transitions and the cast-fizzle
+    // verdict — observing is not acting, so it runs before the alive gate.
+    try {
+        exec::observe_turn(obs);
+    } catch (const std::exception&) { }
+
     // Econ runs AFTER the action: shopping before acting starved tick's
     // fuel and the body never moved on round 1. Its first call costs up
     // to ~110k in shop-list init, which left the thinnest body ~500 fuel
