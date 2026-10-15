@@ -886,6 +886,25 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
     bind_plan(plan);
 
+    // Stale-reward bookkeeping must precede every early return: a channel,
+    // fizzle-verify or tactic turn still observed camps, and skipping the
+    // sighting here leaves ledger::never entries out of reinspection
+    // indefinitely.
+    {
+        const auto& geos0 = groups();
+        if (mem.strikes.size() != geos0.size()) mem.strikes.assign(geos0.size(), 0);
+        if (mem.camp_seen.size() != geos0.size()) mem.camp_seen.assign(geos0.size(), -1);
+        for (const auto& c : obs.camps)
+        {
+            if (c.group < mem.camp_seen.size())
+                mem.camp_seen[c.group] = static_cast<std::int32_t>(obs.round);
+            if (c.group < mem.strikes.size()
+                && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
+                    || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
+                mem.strikes[c.group] = 0;
+        }
+    }
+
     // Mid-channel turns can't act — tribute/recall/teleport continue alone.
     if (st.contains(cs::submitting_gems) || st.contains(cs::recalling) || st.contains(cs::teleporting)
         || (!st.contains(cs::can_move) && !st.contains(cs::can_attack)))
@@ -919,6 +938,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // turn, only skip the offer. std::exception, not just cambc::error:
     // a module's own bad_variant_access/out_of_range would otherwise
     // escape to the whole-tick catch and cost the turn, not the offer.
+    // A winning bag banks before anything else: a carrier that pokes while
+    // holding enough-to-win delays the win and risks feeding the bag away.
+    const bool win_now = econ::winning_bag(obs);
+    if (!win_now)
     try
     {
         if (const auto offer = tactic::offer(obs))
@@ -933,20 +956,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const int here = group_of(pos);
     const bool at_spawn = turn::spawn_region(cambc::team::ally).is_set(pos);
 
-    if (mem.strikes.size() != geos.size()) mem.strikes.assign(geos.size(), 0);
     if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
-    if (mem.camp_seen.size() != geos.size()) mem.camp_seen.assign(geos.size(), -1);
-    // A group seen dead clears its strike history: someone ground it down
-    // this life, so prior failed sorties no longer evidence a trap.
-    for (const auto& c : obs.camps)
-    {
-        if (c.group < mem.camp_seen.size())
-            mem.camp_seen[c.group] = static_cast<std::int32_t>(obs.round);
-        if (c.group < mem.strikes.size()
-            && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
-                || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
-            mem.strikes[c.group] = 0;
-    }
     // Snapshot live member hp/dps sums — rebuilt each round from the
     // members currently in vision, so an edge-of-vision sighting
     // overwrites a fuller read with the subset sum and heal_target
@@ -1467,20 +1477,25 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     std::int64_t haul_dist = 0;
     for (std::size_t g = 0; g < geos.size(); ++g)
     {
+        if (!mine(static_cast<int>(g)) || geos[g].monolith
+            || unreachable(static_cast<int>(g), obs.round))
+            continue;
+        const std::int32_t ready = ledger::ready_round(static_cast<int>(g));
+        // A never-scheduled group claims a slot once unobserved for
+        // stale_rounds — priced as ready now, so the nearest overdue camp
+        // draws the walk that brings it back into vision. The walk only
+        // needs a body in vision, so unfit must not gate it: an unfit camp
+        // whose reward left sight would otherwise stay ledger::never and
+        // the route scan would never collect it.
+        const bool overdue = ready == ledger::never
+            && mem.camp_seen[g] >= 0
+            && static_cast<std::int32_t>(obs.round) - mem.camp_seen[g] >= stale_rounds;
+        if (ready == ledger::never && !overdue)
+            continue;
         // unfit here too: pre-parking on a trap's ring means the respawned
         // pack wakes onto a body that can't fight it — pitstop churn with
         // no active_target, which the strike watchdog can never see.
-        if (!mine(static_cast<int>(g)) || geos[g].monolith
-            || unreachable(static_cast<int>(g), obs.round)
-            || (unfit(geos[g], obs.self_max_health) && !desperate))
-            continue;
-        const std::int32_t ready = ledger::ready_round(static_cast<int>(g));
-        // A never-scheduled group still claims a slot once unobserved for
-        // stale_rounds — priced as ready now, so the nearest overdue camp
-        // draws the walk that brings it back into vision.
-        if (ready == ledger::never
-            && (mem.camp_seen[g] < 0
-                || static_cast<std::int32_t>(obs.round) - mem.camp_seen[g] < stale_rounds))
+        if (unfit(geos[g], obs.self_max_health) && !desperate && !overdue)
             continue;
         const auto d = dist_to(geos[g], pos);
         const std::int32_t eff = ready == ledger::never

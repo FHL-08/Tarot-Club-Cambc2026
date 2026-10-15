@@ -239,15 +239,20 @@ void econ::maybe_buy(Role role, const Obs& obs)
     }
 }
 
+bool econ::winning_bag(const Obs& obs)
+{
+    const std::int64_t ours = turn::submitted_gems(cambc::team::ally);
+    return ours < cambc::constants::winning_gems
+        && obs.self_gems >= cambc::constants::winning_gems - static_cast<std::uint32_t>(ours);
+}
+
 bool econ::should_tribute(const Obs& obs)
 {
     if (obs.self_gems == 0) return false;
     // Instant win: banked + carried reaching winning_gems ends the match —
     // bank ahead of every farming plan; a death hands the bag +50g to the
     // killer instead.
-    const std::int64_t ours = turn::submitted_gems(cambc::team::ally);
-    if (ours < cambc::constants::winning_gems
-        && obs.self_gems >= cambc::constants::winning_gems - static_cast<std::uint32_t>(ours))
+    if (winning_bag(obs))
         return true;
     // Piñata ceiling: deaths hand the killer the whole bag +50g.
     if (obs.self_gems >= 45) return true;
