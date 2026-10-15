@@ -599,6 +599,72 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     return exec::Attack{ best, exec::Attack::Kind::camp };
 }
 
+// Nearest enemy champion in the ring — v2 measured targeting (issue #93):
+// median attacked-target hp% is ~0.5-0.6 on all four teams, so lowest-hp%
+// was a misread; the teams hit whoever is closest.
+const EnemyObs* nearest_champ(const Obs& obs, const cambc::bitboard& attack_tiles)
+{
+    const EnemyObs* best = nullptr;
+    std::int64_t best_d = std::numeric_limits<std::int64_t>::max();
+    for (const auto& e : obs.enemies)
+    {
+        if (e.health <= 0 || e.max_health <= 0 || !attack_tiles.is_set(e.position)) continue;
+        if (const auto d = obs.self_pos.chebyshev_distance(e.position); d < best_d)
+        { best_d = d; best = &e; }
+    }
+    return best;
+}
+
+// Wait-signature fallback (issue #93): teams that never yield spend a
+// would-be Wait on work — poke any owned monster in reach, else drift to
+// the nearest objective's free tiles (group tiles first so a parked
+// capture keeps cooking, then its ring). Nothing left means yield anyway.
+// park_hold (v3 park mode): a group believed respawning is approached on
+// its ring — standing on the spawn tiles themselves stalls the respawn
+// the park is waiting on (GameRules: an occupied spawn tile delays the
+// whole group).
+std::optional<exec::Action> drift_action(const Obs& obs, bool park_hold = false)
+{
+    const auto& geos = groups();
+    if (const auto hit = attack_in_range(turn::attack_tiles(), -1, false))
+        return *hit;
+    const cambc::vec2 pos = obs.self_pos;
+    int g = mem.active_target;
+    if (g < 0 || g >= static_cast<int>(geos.size()))
+    {
+        g = -1;
+        std::int64_t best_d = std::numeric_limits<std::int64_t>::max();
+        for (std::size_t i = 0; i < geos.size(); ++i)
+        {
+            if (!mine(static_cast<int>(i))) continue;
+            if (const auto d = dist_to(geos[i], pos); d < best_d)
+            { best_d = d; g = static_cast<int>(i); }
+        }
+    }
+    if (g < 0) return std::nullopt;
+    cambc::bitboard goals;
+    if (park_hold && ledger::ready_round(g) > static_cast<std::int32_t>(obs.round))
+    {
+        for (const auto tile : geos[g].tile_list) goals.draw_chebyshev(tile, 1);
+        goals &= ~geos[g].tiles;
+        goals &= ~blocked_tiles();
+        goals.set(pos, false);
+    }
+    else
+    {
+        goals = geos[g].tiles & ~blocked_tiles();
+        goals.set(pos, false);
+    }
+    if (goals.is_empty())
+    {
+        for (const auto tile : geos[g].tile_list) goals.draw_chebyshev(tile, 1);
+        goals &= ~geos[g].tiles & ~blocked_tiles();
+        goals.set(pos, false);
+    }
+    if (goals.is_empty()) return std::nullopt;
+    return exec::Move{ std::move(goals) };
+}
+
 // A ready damage/cc payload on the engaged group out-damages a basic
 // swing, and stunned members skip their retaliation — the planner's kit
 // dps already prices this in (burst amortized over the 8-round cooldown),
@@ -638,6 +704,15 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
         mem.state_since = static_cast<std::int32_t>(obs.round);
     }
     return action;
+}
+
+// v3 park mode (issue #93): yields are positional — they happen inside
+// the assigned group's footprint, never in transit — so every reposition
+// goal emits a real Move. The name survives from v2's wait-or-move
+// cadence, now retired.
+exec::Action wait_or_move(State next, cambc::bitboard goals, const Obs& obs)
+{
+    return done(next, exec::Move{ std::move(goals) }, obs);
 }
 
 } // namespace
@@ -682,7 +757,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 turn::slot_targets(1);
                 turn::altars();
                 mem.nav_pending = g0;
-                return done(State::travel, Move{ std::move(free_tiles) }, obs);
+                return wait_or_move(State::travel, std::move(free_tiles), obs);
             }
         }
     }
@@ -731,21 +806,17 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     }
     catch (const std::exception&) { }
 
-    // Attack-on-sight (issue #84): an enemy inside the attack ring is
-    // always hit, lowest hp% first; a target that steps out is chased for
-    // up to clone::chase_cap turns. Below the recall floor the pitstop
-    // owns the turn, so the whole block gates on it.
+    // Attack-on-sight (issue #93): an in-range enemy champion is always
+    // hit, nearest first — the measured ~10% champ-attack share is
+    // emergent (champs are in range that often), not a cadence. A target
+    // that steps out is chased for up to clone::chase_cap turns. Below
+    // the recall floor the pitstop owns the turn, so the whole block
+    // gates on it.
     if (obs.self_health >= obs.self_max_health * clone::recall_hp)
     {
         const EnemyObs* target = nullptr;
         if (st.contains(cs::can_attack))
-        {
-            const auto& attack_tiles = turn::attack_tiles();
-            for (const auto& e : obs.enemies)
-                if (e.health > 0 && e.max_health > 0 && attack_tiles.is_set(e.position)
-                    && (!target || e.health / e.max_health < target->health / target->max_health))
-                    target = &e;
-        }
+            target = nearest_champ(obs, turn::attack_tiles());
         if (target)
         {
             mem.chase_valid = true;
@@ -857,6 +928,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                     const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
+                    if (clone::yield_mode == clone::YieldMode::never)
+                        if (const auto drift = drift_action(obs))
+                            return done(State::capture, *drift, obs);
                     return done(State::capture, Wait{}, obs);
                 }
             }
@@ -869,6 +943,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                     const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
+                    if (clone::yield_mode == clone::YieldMode::never)
+                        if (const auto drift = drift_action(obs))
+                            return done(State::capture, *drift, obs);
                     return done(State::capture, Wait{}, obs);
                 }
             }
@@ -940,7 +1017,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 }
             }
         }
-        if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
+        if (at_spawn)
+        {
+            if (clone::yield_mode == clone::YieldMode::never)
+                if (const auto drift = drift_action(obs))
+                    return done(State::pitstop, *drift, obs);
+            return done(State::pitstop, Wait{}, obs); // turn end heals to full
+        }
         bool exposed = threat;
         for (const auto& c : visible_camps())
             if (!exposed && c.health > 0 && c.strength > 0
@@ -1234,7 +1317,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             }
             if (!stands) continue; // next open stop, or fall to solo logic
             mem.nav_pending = g;
-            return done(State::travel, Move{ free_tiles }, obs);
+            return wait_or_move(State::travel, free_tiles, obs);
         }
     }
 
@@ -1267,9 +1350,12 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             // capture beats a live-camp errand, and a respawned camp eight
             // tiles closer beats the walk. 1-3 tile margins still dither on
             // Voronoi boundaries — the threshold must exceed the flip band.
+            // Nav re-issue (issue #93): hello re-paths on any objective
+            // improvement; the others only when the margin clears.
+            const std::int64_t rival_margin = clone::nav_repath_on_change ? 0 : 8;
             const bool rival = target >= 0 && geos[target].gems > 0
                 && ((target_reward && active_state == 1)
-                    || (target_reward == (active_state == 2) && target_cost + 8 < active_cost));
+                    || (target_reward == (active_state == 2) && target_cost + rival_margin < active_cost));
             if (target < 0 || !rival)
             {
                 target = mem.active_target;
@@ -1286,7 +1372,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         {
             auto free_tiles = geos[target].tiles & ~blocked;
             mem.nav_pending = target;
-            return done(State::travel, Move{ std::move(free_tiles) }, obs);
+            return wait_or_move(State::travel, std::move(free_tiles), obs);
         }
         // Alive (or believed): hit the target already in range — focused
         // fire, so a passerby group never gets woken on the way in —
@@ -1305,7 +1391,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (goals.is_empty()) goals = geos[target].tiles & ~blocked; // rings sealed off: walk onto the tiles
         if (goals.is_empty()) goals = geos[target].tiles;
         mem.nav_pending = target;
-        return done(State::travel, Move{ std::move(goals) }, obs);
+        return wait_or_move(State::travel, std::move(goals), obs);
     }
 
     // Haul: pre-position at the soonest-ready partition group, parked on
@@ -1340,8 +1426,25 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (!ring.is_set(pos) && !ring.is_empty())
         {
             mem.nav_pending = haul;
-            return done(State::haul, Move{ std::move(ring) }, obs);
+            return wait_or_move(State::haul, std::move(ring), obs);
         }
+        // park (issue #93 v3): the yield is positional — emitted only on
+        // the group's ring inside the respawn_wait_rounds window, and only
+        // while no enemy champion sits within ~5 tiles (a close enemy
+        // means fight/flee, handled by the normal guards). Beyond the
+        // window the body works: drift, keeping off the respawning tiles.
+        const bool parked_eta = haul_ready - static_cast<std::int32_t>(obs.round)
+            <= clone::respawn_wait_rounds;
+        bool enemy_near = false;
+        for (const auto& e : obs.enemies)
+            if (e.health > 0 && pos.chebyshev_distance(e.position) <= 5)
+            { enemy_near = true; break; }
+        if (clone::yield_mode == clone::YieldMode::never
+            || (clone::yield_mode == clone::YieldMode::park
+                && (!parked_eta || enemy_near)))
+            if (const auto drift = drift_action(obs,
+                    clone::yield_mode == clone::YieldMode::park))
+                return done(State::haul, *drift, obs);
         return done(State::haul, Wait{}, obs);
     }
 
@@ -1352,7 +1455,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         cambc::bitboard off;
         for (const auto tile : geos[here].tile_list) off.draw_chebyshev(tile, 1);
         off &= ~geos[here].tiles & ~blocked;
-        if (!off.is_empty()) return done(State::haul, Move{ std::move(off) }, obs);
+        if (!off.is_empty()) return wait_or_move(State::haul, std::move(off), obs);
     }
 
     // L1: an idle turn while an owned live uncontested camp exists is a
@@ -1360,6 +1463,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // be proven by vision: an unseen group may be enemy-held, so a ledger
     // belief alone never flags. Unreachable and unsoloable groups are
     // legitimately idle.
+    // Idle work for never and park alike — park yields only inside the
+    // footprint (the haul block above), so an idle body drifts instead.
+    if (const auto drift = drift_action(obs,
+            clone::yield_mode == clone::YieldMode::park))
+        return done(State::idle, *drift, obs);
     return done(State::idle, Wait{}, obs);
     } catch (const std::exception& err)
     {
@@ -1423,22 +1531,26 @@ bool exec::apply(const Action& action)
                 if (moved && me.can_attack())
                 {
                     const auto& attack_tiles = turn::attack_tiles();
-                    float best_health = 0;
-                    bool found = false;
-                    cambc::vec2 hit{};
-                    for (const auto& e : visible_enemies())
+                    // Champion in range outranks the nav target's group —
+                    // the same attack-on-sight preference as tick.
                     {
-                        if (!e.is_visible() || e.health() <= 0
-                            || !attack_tiles.is_set(e.position())) continue;
-                        if (!found || e.health() < best_health)
-                        { hit = e.position(); best_health = e.health(); found = true; }
-                    }
-                    if (found)
-                        if (const auto* enemy = turn::enemy_at(hit))
+                        cambc::vec2 hit{};
+                        std::int64_t hit_d = std::numeric_limits<std::int64_t>::max();
+                        for (const auto& e : visible_enemies())
                         {
-                            try { me.attack(*enemy); return true; }
-                            catch (const cambc::error&) { /* tile emptied mid-turn */ }
+                            if (!e.is_visible() || e.health() <= 0
+                                || !attack_tiles.is_set(e.position())) continue;
+                            if (const auto d = me.position().chebyshev_distance(e.position());
+                                d < hit_d)
+                            { hit = e.position(); hit_d = d; }
                         }
+                        if (hit_d < std::numeric_limits<std::int64_t>::max())
+                            if (const auto* enemy = turn::enemy_at(hit))
+                            {
+                                try { me.attack(*enemy); return true; }
+                                catch (const cambc::error&) { /* tile emptied mid-turn */ }
+                            }
+                    }
                     if (mem.nav_pending >= 0)
                     {
                         for (const auto& c : visible_camps())
@@ -1508,21 +1620,23 @@ bool exec::apply(const Action& action)
                 }
                 // An attack-reset cast restores the attack allowance it
                 // didn't consume (GameRules §Combat) — spend it on the
-                // lowest-health enemy still in range.
+                // nearest champion still in range.
                 if (abilities[a.slot].is_attack_reset() && me.can_attack())
                 {
                     const auto& attack_tiles = turn::attack_tiles();
                     cambc::vec2 hit{};
-                    float hit_hp = std::numeric_limits<float>::max();
+                    std::int64_t hit_d = std::numeric_limits<std::int64_t>::max();
                     for (const auto& e : visible_enemies())
                         try
                         {
                             if (!e.is_visible() || !attack_tiles.is_set(e.position())) continue;
-                            const float hp = e.health();
-                            if (hp > 0 && hp < hit_hp) { hit_hp = hp; hit = e.position(); }
+                            if (e.health() <= 0) continue;
+                            if (const auto d = me.position().chebyshev_distance(e.position());
+                                d < hit_d)
+                            { hit = e.position(); hit_d = d; }
                         }
                         catch (const cambc::error&) { continue; } // stale entity — skip this turn
-                    if (hit_hp < std::numeric_limits<float>::max())
+                    if (hit_d < std::numeric_limits<std::int64_t>::max())
                         if (const auto* enemy = turn::enemy_at(hit))
                         {
                             try { me.attack(*enemy); }
