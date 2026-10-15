@@ -136,6 +136,10 @@ struct Mem {
     bool cast_banned[2] = { false, false };
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
+    // Recall-gate chase read: last round's visible enemy positions — an
+    // attacker whose distance to our current tile fell is closing on us.
+    struct EnemyMark { cambc::vec2 pos{}; };
+    std::vector<EnemyMark> last_enemies;
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
     // Compiled-plan binding, filled once from the draft blob. `route` is a
     // view into the Bot-held Plan — both stay valid for the whole match.
@@ -1239,25 +1243,95 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         mem.farm_damage = false; // consumed — the next sortie starts a fresh ledger
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
+        // A carrier that reaches an altar mid-retreat banks by the normal
+        // trigger: damage never breaks a tribute (GameRules §Channels), so
+        // the bag lands under the same fire that cancels recall.
+        if (obs.self_gems > 0)
+        {
+            const auto& altars = turn::altars();
+            for (std::size_t i = 0; i < altars.size(); ++i)
+                if (pos.chebyshev_distance(altars[i]) <= cambc::constants::submit_gems_range)
+                {
+                    if (win_now
+                        || (mem.have_route && mem.bag_cap && obs.self_gems >= mem.bag_cap)
+                        || econ::should_tribute(obs))
+                        return done(State::bank, Channel{ Channel::Kind::tribute, altars[i] }, obs);
+                    break;
+                }
+        }
         bool exposed = threat;
         for (const auto& c : visible_camps())
             if (!exposed && c.health > 0 && c.strength > 0
                 && pos.chebyshev_distance(c.pos) <= c.attack_range)
                 exposed = true;
-        // An enemy at reach+2 walks in and breaks the 5-round channel:
-        // walking home instead keeps us moving out of its attack line.
-        if (!exposed)
-            for (const auto& e : obs.enemies)
-                if (pos.chebyshev_distance(e.position) <= 5) { exposed = true; break; }
+        // Recall breaks on any damage (GameRules §Channels), so it only
+        // starts where nothing can hurt it for the whole channel. Inside
+        // ~5 tiles a single move puts almost any kit in range — never
+        // start. Too slow to arrive inside recall_time never breaks it.
+        // In between the veto goes to a body that is actually coming —
+        // its distance to *this* tile fell since last round (a gap delta
+        // to us hides the pursuit: we keep moving while kiting). A
+        // bystander holding its ground is paid a free teleport home; a
+        // fresh sighting reads as incoming.
+        for (const auto& e : obs.enemies)
+        {
+            if (exposed) break;
+            const auto gap = pos.chebyshev_distance(e.position);
+            if (gap <= 5) { exposed = true; break; }
+            const auto* info = turn::enemy_info(e.position);
+            const int speed = info && info->move_speed > 0 ? info->move_speed : 4;
+            const int range = info && info->attack_range > 0 ? info->attack_range : 3;
+            if (gap > range + speed * cambc::constants::recall_time) continue;
+            const Mem::EnemyMark* mark = nullptr;
+            float nearest = std::numeric_limits<float>::max();
+            for (const auto& m : mem.last_enemies)
+                if (const auto d = m.pos.chebyshev_distance(e.position); d < nearest)
+                { nearest = d; mark = &m; }
+            // Enemies move <= ~5 between rounds — a mark within 6 is the
+            // same body.
+            if (!mark || nearest > 6
+                || pos.chebyshev_distance(e.position) < pos.chebyshev_distance(mark->pos))
+                exposed = true;
+        }
+        mem.last_enemies.clear();
+        for (const auto& e : obs.enemies)
+            mem.last_enemies.push_back({ e.position });
         if (!exposed && mem.recall_attempts < max_recall_retries)
         {
             mem.recall_pending = true;
             return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
         }
-        // Escape leg (v17 protect_escape): apply() may spend a defensive
-        // spell around the step — before it only walking-compatible ones,
-        // and a failed step frees the stationary kit for the lost turn.
-        Move escape{ turn::spawn_region(cambc::team::ally) };
+        // Escape leg: kite home, not beeline — step only onto tiles that
+        // open the gap on every visible enemy, preferring ones that don't
+        // lose spawnward progress. A raw spawn descent walks straight past
+        // the chaser or stalls walled into its reach, and a stalled leg
+        // reads as a yield inside chase range. apply() keeps the fight
+        // side: escape spells around the step, then a hit if one lands.
+        cambc::bitboard open = ~blocked_tiles();
+        for (const auto& e : obs.enemies)
+        {
+            cambc::bitboard close;
+            close.draw_chebyshev(e.position,
+                static_cast<float>(pos.chebyshev_distance(e.position)));
+            open &= ~close;
+        }
+        const auto spawn = turn::spawn_region(cambc::team::ally);
+        cambc::bitboard goals = open;
+        if (!open.is_empty())
+        {
+            int home_dist = std::numeric_limits<int>::max();
+            cambc::vec2 anchor{};
+            for (const auto t : spawn.positions())
+            {
+                const auto d = static_cast<int>(pos.chebyshev_distance(t));
+                if (d < home_dist) { home_dist = d; anchor = t; }
+            }
+            cambc::bitboard homeward;
+            homeward.draw_chebyshev(anchor, static_cast<float>(home_dist));
+            if (const auto both = open & homeward; !both.is_empty()) goals = both;
+        }
+        if (goals.is_empty()) goals = spawn; // surrounded — push through
+        Move escape{ std::move(goals) };
         escape.escaping = true;
         return done(State::pitstop, escape, obs);
     }
