@@ -11,7 +11,6 @@
 #include <limits>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -38,15 +37,17 @@ constexpr int join_capture_range = 6;
 // Fall back instead of fighting when nearby enemies are this much stronger.
 constexpr float outmatched_ratio = 1.3f;
 
-// A camp back from respawn within this many rounds of our arrival stays a
-// farm target (Mite measured ~20): the wait is priced into its turns, so a
-// nearby respawn beats a long walk and the farmer yields parked on its ring.
-constexpr int park_window = 20;
-
-// A champ that owns a cleared camp holds it through the respawn — the elk's
-// 60 is the longest non-monolith wait — yielding on its ring instead of
-// drifting to the next objective early (issue #112).
-constexpr int park_hold = 61;
+// Game phases (the user's plan). Early: farm and feed Stellar, only push away
+// enemies that come into reach. Mid (Stellar or Varg owns an emblem): hit
+// enemies within mid_leash, then go back to farming. Late (Stellar owns three
+// emblems): fight as before. Early and mid stay out of the enemy's half and
+// back off when outnumbered by 2.
+enum class Phase { early, mid, late };
+constexpr std::uint32_t mid_game_by = 600;  // round: mid game even without an emblem
+constexpr int mid_leash = 5;                // mid game: engage enemies this close
+constexpr int deep_margin = 4;              // enemy half: this much closer to their spawn
+constexpr int outnumbered_by = 2;           // enemies - allies within 6 tiles -> back off
+constexpr int stellar_join_range = 8;       // Stellar walks this far to take a capture's gold
 
 
 namespace {
@@ -97,16 +98,6 @@ float health_pct(const cambc::unit& u) {
         return u.max_health() > 0 ? u.health() / u.max_health() : 1.0f;
     } catch (const std::exception&) {
         return 1.0f;
-    }
-}
-
-// A stunned body outranks damage threat: converging on the target a
-// teammate already disabled is what makes the kill chain emerge.
-bool stunned(const cambc::champion& e) {
-    try {
-        return e.buffs().has_stun();
-    } catch (const std::exception&) {
-        return false;
     }
 }
 
@@ -185,21 +176,17 @@ float threat(const cambc::champion& e) {
 }
 
 // Greatest damage threat, optionally only among enemies within max_range of us.
-// prefer_stunned is for the in-range hit pick: a stunned body outranks
-// threat, but the bonus must not pull approaches across the map.
 std::optional<cambc::champion> top_threat(const std::vector<cambc::champion>& enemies,
-                                          int max_range = 1000, bool prefer_stunned = false) {
+                                          int max_range = 1000) {
     const auto me = cambc::self().position();
     std::optional<cambc::champion> best;
     float best_threat = -1;
-    bool best_stunned = false;
     for (const auto& e : enemies) {
         if (!alive(e) || dist(me, safe_pos(e, vec2{-1000, -1000})) > max_range)
             continue;
         const float t = threat(e);
-        const bool s = prefer_stunned && stunned(e);
-        if (!best || (s && !best_stunned) || (s == best_stunned && t > best_threat))
-            best = e, best_threat = t, best_stunned = s;
+        if (!best || t > best_threat)
+            best = e, best_threat = t;
     }
     return best;
 }
@@ -285,30 +272,6 @@ std::pair<std::optional<vec2>, int> best_area_tile(const cambc::ability* a,
     return {best, best_hits};
 }
 
-// Cast a ready disable on a committed target before the basic hit lands:
-// chained stuns win the trade that a string of basics never does. A target
-// already stunned makes the cast a waste, so the hit goes through instead;
-// a landed disable still leaves this turn's attack allowance free.
-bool disable_first(const cambc::champion& target) {
-    auto& me = cambc::self();
-    if (!me.can_cast() || stunned(target))
-        return false;
-    const auto at = safe_pos(target, me.position());
-    const auto abilities = me.abilities();
-    for (const auto& a : abilities) {
-        try {
-            if (!a.is_cc() || !a.is_ready() || !a.valid_tiles().is_set(at))
-                continue;
-            if (a.can_target_ground() && !a.can_target_enemies())
-                return attempt([&] { return a.use(at); });
-            if (a.can_target_enemies())
-                return attempt([&] { return a.use(target); });
-        } catch (const std::exception&) {
-        }
-    }
-    return false;
-}
-
 // ---------------------------------------------------------------- burst
 // mingstudy-ttsburst: port of ming_bot tactic/burst.cpp part 1. Whenever a
 // ready damage / area / stun spell can reach an enemy champion (not one healing
@@ -361,8 +324,6 @@ bool burst() {
             return true;
         if (a.channel != b->channel)
             return a.channel;
-        if (a.stunned != b->stunned)
-            return a.stunned;
         if (a.hp != b->hp)
             return a.hp < b->hp;
         return a.gems > b->gems;
@@ -485,12 +446,9 @@ bool attack_lock(const cambc::altar_lock& lock) {
     });
 }
 
-// Attack, then use an attack reset (if one is ready) to attack again. A
-// committed champion target eats a ready disable first (see disable_first).
+// Attack, then use an attack reset (if one is ready) to attack again.
 template<class Target>
 bool attack_with_reset(const Target& target, const cambc::ability* reset) {
-    if constexpr (std::is_same_v<Target, cambc::champion>)
-        disable_first(target);
     if (!basic_attack(target))
         return false;
     if (cast_self(reset) && !basic_attack(target))
@@ -500,11 +458,10 @@ bool attack_with_reset(const Target& target, const cambc::ability* reset) {
     return true;
 }
 
-// Basic-attack the greatest threat in range; a stunned enemy in reach
-// outranks it — that is the disable-follow-up kill chain.
+// Basic-attack the greatest threat in range, or any enemy in range.
 bool attack_enemies(const std::vector<cambc::champion>& enemies, const cambc::ability* reset) {
     auto& me = cambc::self();
-    if (auto t = top_threat(enemies, me.attack_range(), true))
+    if (auto t = top_threat(enemies, me.attack_range()))
         return attack_with_reset(*t, reset);
     return false;
 }
@@ -649,11 +606,8 @@ std::vector<int>& taken_until() {
     return taken;
 }
 
-// A parked champ leaves its wait on a fight/danger alarm — the normal
-// retarget-and-fight path takes over (issue #112).
-bool park_alarmed() {
-    return team_memory::fight_alarm() || team_memory::danger_alarm();
-}
+bool off_limits(std::size_t i);
+bool leave_to_stellar(const GroupInfo& g);
 
 // Is any of the group's spawn tiles in vision? Checks its few tiles instead of
 // intersecting two full-map bitboards (that cost ~34k fuel a turn on lanes).
@@ -686,25 +640,6 @@ void update_ledger() {
     }
 }
 
-// The group's monsters are all down with capture or respawn still pending —
-// believed respawning, or in view and no longer alive. A squad objective in
-// this state is a wait to park through, not a target to leave (issue #112).
-bool group_waiting(vec2 tile) {
-    const auto* g = group_at(tile);
-    if (!g)
-        return false;
-    const auto i = static_cast<std::size_t>(g - groups().data());
-    if (ready_round()[i] > static_cast<int>(cambc::round_number()))
-        return true;
-    if (!group_in_view(*g, cambc::vision::visible_tiles()))
-        return false;
-    try {
-        return !std::holds_alternative<cambc::map::camp_group_alive>(g->group.state());
-    } catch (const std::exception&) {
-        return false;
-    }
-}
-
 // Pick the camp group worth the most gems (plus a little gold) per turn spent
 // walking there, clearing it and capturing it. The monolith hits too hard to
 // be worth it unless nothing else is left, the group in `exclude` (the other
@@ -712,34 +647,8 @@ bool group_waiting(vec2 tile) {
 // clearly better.
 std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
                                 std::optional<vec2> exclude = std::nullopt, bool wolves = false,
-                                int helpers = -1, int park_keep = 0) {
+                                int helpers = -1) {
     const int round = static_cast<int>(cambc::round_number());
-    // camp-park (issue #112): an assigned camp in a respawn wait stays the
-    // objective when waiting beats rotating — the champ holds its ring and
-    // yields instead of drifting to the next objective early. Imminent
-    // respawns always park; longer waits park only when every ready camp
-    // already costs more turns to reach and take than sitting here.
-    if (current && park_keep > 0 && !park_alarmed())
-        if (const auto* g = group_at(*current)) {
-            const auto i = static_cast<std::size_t>(g - groups().data());
-            const int wait = ready_round()[i] - round;
-            if (!g->monolith && wait > 0 && wait <= park_keep) {
-                int alt = std::numeric_limits<int>::max();
-                for (std::size_t j = 0; j < groups().size(); ++j) {
-                    const auto& o = groups()[j];
-                    if (j == i || o.monolith || taken_until()[j] > round
-                        || ready_round()[j] > round)
-                        continue;
-                    int dj = 1000;
-                    for (const auto p : o.spawns)
-                        dj = std::min(dj, dist(from, p));
-                    alt = std::min(alt, dj + o.health / 250
-                            + static_cast<int>(cambc::constants::capture_time));
-                }
-                if (wait <= park_window || wait <= alt + 10)
-                    return current;
-            }
-        }
     // Health of the champion who will take the camp's hits (only checked when
     // the leader has nobody near to help).
     float my_health = 0;
@@ -759,6 +668,8 @@ std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
         const auto& g = groups()[i];
         if (exclude && g.tiles.is_set(*exclude))
             continue;
+        if (off_limits(i))
+            continue;
         if (taken_until()[i] > round)
             continue;
         // Alone, don't start a fighting camp that would beat us (camps hit
@@ -773,18 +684,16 @@ std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
                 d = dist(from, p);
                 closest = p;
             }
-        // Still respawning when we would arrive: not a target yet — unless the
-        // wait fits park_window, in which case parking for it stays a candidate.
+        // Still respawning when we would arrive: not a target yet.
         const int wait = ready_round()[i] - round - d;
         if (wait > 0) {
             if (!g.monolith && wait < soonest_wait) {
                 soonest_wait = wait;
                 soonest = closest;
             }
-            if (g.monolith || wait > park_keep || park_alarmed())
-                continue;
+            continue;
         }
-        const double turns = d + std::max(wait, 0) + g.health / 250.0 + cambc::constants::capture_time;
+        const double turns = d + g.health / 250.0 + cambc::constants::capture_time;
         // Gems win the game; a gold-only camp is filler, picked only when no
         // gem camp is available (value 0 still beats "nothing").
         double value = g.gems / turns;
@@ -863,6 +772,11 @@ void farm_group(vec2 target, const Abilities& abilities) {
                 for (const auto t : g->spawns)
                     goals |= square(t, 1);
                 goals &= ~g->tiles;
+            } else if (leave_to_stellar(*g)) {
+                // Stellar takes this gold: wait next to it, off its tiles.
+                for (const auto t : g->spawns)
+                    goals |= square(t, 1);
+                goals &= ~g->tiles;
             } else {
                 goals = g->tiles;
                 // Every spawn tile is taken by someone capturing it: move on.
@@ -893,7 +807,7 @@ bool farm_nearby_cluster(const Abilities& abilities, int radius) {
     int best_d = radius + 1;
     for (std::size_t i = 0; i < groups().size(); ++i) {
         const auto& g = groups()[i];
-        if (!g.passive || g.gems == 0 || ready_round()[i] > round || taken_until()[i] > round)
+        if (!g.passive || g.gems == 0 || ready_round()[i] > round || taken_until()[i] > round || off_limits(i))
             continue;
         for (const auto t : g.spawns)
             if (dist(here, t) < best_d) {
@@ -912,10 +826,12 @@ bool farm_nearby_cluster(const Abilities& abilities, int radius) {
 bool join_capture() {
     const auto here = cambc::self().position();
     const auto visible = cambc::vision::visible_tiles();
+    const int range = cambc::self().champion_name() == cambc::champion_type::stellar ? stellar_join_range
+                                                                                      : join_capture_range;
     for (const auto& g : groups()) {
         bool near = false;
         for (const auto p : g.spawns)
-            near |= dist(here, p) <= join_capture_range;
+            near |= dist(here, p) <= range;
         if (!near || !group_in_view(g, visible))
             continue;
         bool cleared = false;
@@ -925,6 +841,8 @@ bool join_capture() {
         }
         if (!cleared)
             continue;
+        if (leave_to_stellar(g))
+            continue; // Stellar takes this gold
         if (g.tiles.is_set(here))
             return true; // already capturing: stay
         if (g.gold == 0 || (g.tiles & ~blocked_tiles()).is_empty())
@@ -1032,6 +950,7 @@ struct Context {
     std::optional<team_memory::Objective> objective;
     std::optional<vec2> anchor; // Ryth's position, if fresh
     bool hunt = false; // this champion's squad is hunting (no camp to farm)
+    std::vector<cambc::champion> threats; // every enemy in sight off its spawn; enemies = the ones to engage
 };
 
 // Fight odds: a side's strength near here is the sum of health x damage of
@@ -1061,50 +980,73 @@ void fall_back() {
     step_towards(cambc::map::spawn_region(team::ally));
 }
 
-// Bodies packed inside Chebyshev 2 of self (self counts): at 3+, a single
-// radius-1 area disable centred between them covers the whole clump.
-int clump_count(const std::vector<cambc::champion>& allies) {
-    const auto here = cambc::self().position();
-    int n = 1;
-    for (const auto& a : allies)
-        n += dist(safe_pos(a, vec2{-1000, -1000}), here) <= 2;
-    return n;
+Phase game_phase() {
+    if (team_memory::late_game())
+        return Phase::late;
+    if (team_memory::mid_game() || cambc::round_number() >= mid_game_by)
+        return Phase::mid;
+    return Phase::early;
 }
 
-// The tiles in `band` spaced at least 3 from every ally and 2 from every
-// enemy — out of one area disable's cover.
-bitboard spread_tiles(const std::vector<cambc::champion>& allies,
-                      const std::vector<cambc::champion>& enemies, const bitboard& band) {
-    bitboard open;
-    open.clear();
-    for (const auto t : band.positions()) {
-        bool ok = true;
-        for (const auto& a : allies)
-            if (dist(t, safe_pos(a, vec2{-1000, -1000})) < 3) {
-                ok = false;
-                break;
+// Deep in the enemy's half: clearly closer to their spawn than to ours.
+bool deep(vec2 t) {
+    return distance_to_region(t, cambc::map::spawn_region(team::enemy)) + deep_margin
+        < distance_to_region(t, cambc::map::spawn_region(team::ally));
+}
+
+// Per group (cached): is its spawn tile nearest our base deep in their half?
+bool deep_group(std::size_t i) {
+    static std::vector<signed char> cache(groups().size(), -1);
+    if (cache[i] < 0) {
+        std::int64_t best = std::numeric_limits<std::int64_t>::max();
+        vec2 closest{};
+        const auto& ours = cambc::map::spawn_region(team::ally);
+        for (const auto t : groups()[i].spawns)
+            if (const auto d = distance_to_region(t, ours); d < best) {
+                best = d;
+                closest = t;
             }
-        if (ok)
-            for (const auto& e : enemies)
-                if (dist(t, safe_pos(e, vec2{-1000, -1000})) < 2) {
-                    ok = false;
-                    break;
-                }
-        if (ok)
-            open.set(t);
+        cache[i] = deep(closest) ? 1 : 0;
     }
-    return open;
+    return cache[i] == 1;
 }
 
-// Non-melee fight shape: a clumped back line orbits to a tile in its usual
-// band that keeps every body at least 3 apart, instead of stacking on the
-// same approach tile.
-bool spread(const Context& ctx, vec2 target, int lo, int hi) {
-    if (cambc::self().attack_range() <= 1 || clump_count(ctx.allies) < 3)
+// Camps we stay away from before the late game.
+bool off_limits(std::size_t i) {
+    return game_phase() != Phase::late && deep_group(i);
+}
+
+std::optional<vec2> stellar_position() {
+    for (const auto& a : visible_allies())
+        if (alive(a) && a.champion_name() == cambc::champion_type::stellar)
+            return safe_pos(a, vec2{-100, -100});
+    return std::nullopt;
+}
+
+// Gold goes to Stellar: when she is near a cleared group that pays gold,
+// Varg leaves it to her and at most one other teammate shares it with her.
+bool leave_to_stellar(const GroupInfo& g) {
+    auto& me = cambc::self();
+    const auto mine = me.champion_name();
+    if (g.gold == 0 || mine == cambc::champion_type::stellar)
         return false;
-    const auto open = spread_tiles(ctx.allies, ctx.enemies, ring(target, lo, hi))
-        & ~blocked_tiles();
-    return !open.is_empty() && step_towards(open);
+    const auto s = stellar_position();
+    if (!s)
+        return false;
+    bool near = false;
+    for (const auto t : g.spawns)
+        near |= dist(*s, t) <= 6;
+    if (!near)
+        return false;
+    if (mine == cambc::champion_type::varg)
+        return true;
+    if (g.tiles.is_set(me.position()))
+        return false; // already sharing it
+    int others = 0;
+    for (const auto& a : visible_allies())
+        others += alive(a) && a.champion_name() != cambc::champion_type::stellar
+            && g.tiles.is_set(safe_pos(a, vec2{-100, -100}));
+    return others >= 1;
 }
 
 // Squad A follows Ryth's position; squad B follows the objective its leader shares.
@@ -1120,10 +1062,64 @@ Context read_context(bool squad_a) {
     // Enemies on their own spawn heal to full every turn: never engage them.
     const auto& their_spawn = cambc::map::spawn_region(team::enemy);
     std::erase_if(ctx.enemies, [&](const auto& e) { return their_spawn.is_set(safe_pos(e, vec2{-1, -1})); });
+    ctx.threats = ctx.enemies;
+    // Who to engage depends on the phase: early only enemies already in
+    // reach (push them away, no chasing); mid those within the leash and not
+    // deep in their half; late everyone in sight.
+    const auto phase = game_phase();
+    if (phase != Phase::late) {
+        auto& me = cambc::self();
+        const auto here = me.position();
+        const int reach = phase == Phase::early ? std::max<int>(static_cast<int>(me.attack_range()), 2) : mid_leash;
+        std::erase_if(ctx.enemies, [&](const auto& e) {
+            const auto at = safe_pos(e, vec2{-1000, -1000});
+            return dist(here, at) > reach || (phase == Phase::mid && deep(at));
+        });
+    }
     return ctx;
 }
 
+// Back off? Clearly outmatched in strength (any phase), or, before the late
+// game, outnumbered by 2+ within 6 tiles.
+bool should_retreat(const Context& ctx) {
+    if (ctx.threats.empty())
+        return false;
+    const auto here = cambc::self().position();
+    if (outmatched(ctx.threats, ctx.allies) && nearest_enemy_distance(ctx.threats, here) <= 4)
+        return true;
+    if (game_phase() == Phase::late)
+        return false;
+    int enemies = 0, allies = 1;
+    for (const auto& e : ctx.threats)
+        enemies += alive(e) && dist(here, safe_pos(e, vec2{-1000, -1000})) <= 6;
+    for (const auto& a : ctx.allies)
+        allies += alive(a) && dist(here, safe_pos(a, vec2{-1000, -1000})) <= 6;
+    return enemies - allies >= outnumbered_by;
+}
+
+// Fall back to the nearest teammate who is not under attack, else to base.
+void retreat(const Context& ctx) {
+    const auto here = cambc::self().position();
+    std::optional<vec2> best;
+    int best_d = 1000;
+    for (const auto& a : ctx.allies) {
+        if (!alive(a))
+            continue;
+        const auto at = safe_pos(a, vec2{-1000, -1000});
+        if (nearest_enemy_distance(ctx.threats, at) <= 4 || dist(here, at) >= best_d)
+            continue;
+        best_d = dist(here, at);
+        best = at;
+    }
+    if (best && best_d > 2)
+        step_towards(ring(*best, 1, 2));
+    else
+        fall_back();
+}
+
 } // namespace
+
+const char* champion_label(cambc::champion_type t); // scouting section below
 
 // ==================================================================== Bot
 
@@ -1161,8 +1157,24 @@ void Bot::init() {
 
 void Bot::shop() {
     auto& me = cambc::self();
-    // Issac leads squad B into camps, so he builds like a tank.
-    const auto build = build_for(me.champion_name() == cambc::champion_type::issac ? Role::tank : role);
+    using T = cambc::champion_type;
+    using I = cambc::item_type;
+    const auto name = me.champion_name();
+    // The phase advances with the carries' emblems (5 matching shards each).
+    if ((name == T::stellar || name == T::varg) && shards_bought >= 5 && !team_memory::mid_game()) {
+        team_memory::set_mid_game();
+        std::cout << "SCOUT PHASE " << cambc::round_number() << " mid " << champion_label(name) << std::endl;
+    }
+    if (name == T::stellar && shards_bought >= 15 && !team_memory::late_game()) {
+        team_memory::set_late_game();
+        std::cout << "SCOUT PHASE " << cambc::round_number() << " late Stellar" << std::endl;
+    }
+    // Stellar is the team's carry: all Focus. Varg farms alone: Jungle
+    // Strength (camps hit softer), then Power Strength. Issac leads squad B
+    // into camps, so he builds like a tank.
+    const auto build = name == T::stellar ? std::vector<cambc::item_type>{I::power_shard_of_focus}
+        : name == T::varg ? std::vector<cambc::item_type>{I::jungle_shard_of_strength, I::power_shard_of_strength}
+        : build_for(name == T::issac ? Role::tank : role);
     const auto lock = cambc::consumable_type::altar_lock;
     if (me.consumables()[lock].count() == 0 && me.can_buy(lock))
         attempt([&] { me.buy(lock); return true; });
@@ -1241,28 +1253,6 @@ bool Bot::survive() {
     // Otherwise run home; recall only once out of reach.
     step_towards(cambc::map::spawn_region(team::ally));
     return true;
-}
-
-// Bail on disable: once any body in a packed clump is seen stunned, the
-// blob is one area disable from a wipe — step out of it, then let the turn
-// continue (a melee champ can still swing after the step). A self-stun is
-// remembered for one turn (was_stunned), since it cannot move that turn.
-void Bot::bail_from_clump(bool stun_seen) {
-    const auto here = cambc::self().position();
-    const auto enemies = visible_enemies();
-    if (nearest_enemy_distance(enemies, here) > 4)
-        return;
-    const auto allies = visible_allies();
-    int clumped = 1;
-    for (const auto& a : allies) {
-        if (dist(safe_pos(a, vec2{-1000, -1000}), here) > 2)
-            continue;
-        ++clumped;
-        stun_seen = stun_seen || stunned(a);
-    }
-    if (clumped < 3 || !stun_seen)
-        return;
-    step_towards(spread_tiles(allies, enemies, square(here, 2)) & ~blocked_tiles());
 }
 
 // Carried gems are banked straight away (tested best: carrying gems loses them).
@@ -1380,7 +1370,7 @@ void Bot::choose_objective() {
         helpers += dist(safe_pos(a, vec2{-100, -100}), here) <= 5;
     switch (role) {
     case Role::fighter:
-        farm_target = choose_camp(here, farm_target, std::nullopt, false, helpers, park_hold);
+        farm_target = choose_camp(here, farm_target, std::nullopt, false, helpers);
         if (farm_target)
             team_memory::set_objective(*farm_target, false);
         else
@@ -1390,7 +1380,7 @@ void Bot::choose_objective() {
         std::optional<vec2> exclude;
         if (vendetta_camp && !vendetta_camp->hunt)
             exclude = vendetta_camp->tile;
-        farm_target = choose_camp(here, farm_target, exclude, false, helpers, park_window);
+        farm_target = choose_camp(here, farm_target, exclude, false, helpers);
         hunting = !farm_target;
         break;
     }
@@ -1400,8 +1390,7 @@ void Bot::choose_objective() {
         break; // farmer_turn picks its own camps
     case Role::mage: {
         const bool leader_heard = squad_a ? team_memory::anchor().has_value() : vendetta_camp.has_value();
-        farm_target = leader_heard ? std::nullopt
-                                   : choose_camp(here, farm_target, std::nullopt, false, -1, park_hold);
+        farm_target = leader_heard ? std::nullopt : choose_camp(here, farm_target);
         break;
     }
     }
@@ -1422,7 +1411,8 @@ bool Bot::farm_nearby_wolf(const Abilities& abilities, std::optional<vec2> leade
     int best_d = 13;
     for (std::size_t i = 0; i < groups().size(); ++i) {
         const auto& g = groups()[i];
-        if (g.passive || g.strength > 20 || g.gems == 0 || ready_round()[i] > round || taken_until()[i] > round)
+        if (g.passive || g.strength > 20 || g.gems == 0 || ready_round()[i] > round || taken_until()[i] > round
+            || off_limits(i))
             continue;
         for (const auto t : g.spawns) {
             // Near the leader for help, but not the leader's own camp.
@@ -1456,43 +1446,13 @@ bool Bot::farm_nearby_wolf(const Abilities& abilities, std::optional<vec2> leade
 std::optional<vec2> choose_solo_camp(vec2 from, std::optional<vec2> current, std::optional<vec2> avoid_a,
                                      std::optional<vec2> avoid_b) {
     const int round = static_cast<int>(cambc::round_number());
-    // camp-park (issue #112): a solo farmer parks on its camp when waiting
-    // beats the walk to the next cluster, same rule as the squad's keep.
-    if (current && !park_alarmed())
-        if (const auto* g = group_at(*current)) {
-            const auto i = static_cast<std::size_t>(g - groups().data());
-            const int wait = ready_round()[i] - round;
-            if (!g->monolith && wait > 0 && wait <= park_hold) {
-                int alt = std::numeric_limits<int>::max();
-                for (std::size_t j = 0; j < groups().size(); ++j) {
-                    const auto& o = groups()[j];
-                    if (j == i || o.gems == 0 || o.monolith
-                        || (!o.passive && o.strength > 20)
-                        || taken_until()[j] > round || ready_round()[j] > round)
-                        continue;
-                    int dj = 1000;
-                    vec2 closest{};
-                    for (const auto p : o.spawns)
-                        if (dist(from, p) < dj) {
-                            dj = dist(from, p);
-                            closest = p;
-                        }
-                    if ((avoid_a && dist(*avoid_a, closest) <= 3)
-                        || (avoid_b && dist(*avoid_b, closest) <= 3))
-                        continue;
-                    alt = std::min(alt, dj + o.health / 100
-                            + static_cast<int>(cambc::constants::capture_time));
-                }
-                if (wait <= park_window || wait <= alt + 10)
-                    return current;
-            }
-        }
     std::optional<vec2> best, soonest;
     double best_value = -1;
     int soonest_wait = std::numeric_limits<int>::max();
     for (std::size_t i = 0; i < groups().size(); ++i) {
         const auto& g = groups()[i];
-        if (g.gems == 0 || g.monolith || (!g.passive && g.strength > 20) || taken_until()[i] > round)
+        if (g.gems == 0 || g.monolith || (!g.passive && g.strength > 20) || taken_until()[i] > round
+            || off_limits(i))
             continue;
         const bool is_current = current && g.tiles.is_set(*current);
         int d = 1000;
@@ -1510,10 +1470,9 @@ std::optional<vec2> choose_solo_camp(vec2 from, std::optional<vec2> current, std
                 soonest_wait = wait;
                 soonest = closest;
             }
-            if (wait > park_hold || park_alarmed())
-                continue;
+            continue;
         }
-        double value = g.gems / (d + std::max(wait, 0) + g.health / 100.0 + cambc::constants::capture_time);
+        double value = g.gems / (d + g.health / 100.0 + cambc::constants::capture_time);
         if (is_current)
             value *= stick_bonus;
         if (value > best_value) {
@@ -1531,9 +1490,8 @@ void Bot::farmer_turn() {
     const auto* reset = find_ability(abilities, is_reset);
     const auto* shield = find_ability(abilities, is_shield);
     const bool engage = !ctx.enemies.empty();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
     if (engage) {
@@ -1556,7 +1514,11 @@ void Bot::farmer_turn() {
     if (ctx.objective && !ctx.objective->hunt)
         squad_b = ctx.objective->tile;
     farm_target = choose_solo_camp(me.position(), farm_target, ctx.anchor, squad_b);
-    if (!farm_target) { // nothing to solo here: work Ryth's camps with his squad
+    if (!farm_target) { // nothing to solo here: help Issac's squad clear its camp
+        if (squad_b) {
+            farm_group(*squad_b, abilities);
+            return;
+        }
         if (hit_camps(std::nullopt, abilities))
             return;
         if (ctx.anchor)
@@ -1674,7 +1636,6 @@ void Bot::play_turn() {
     scout(reporter);
 
     if (!me.is_alive()) { // dead champions can still shop
-        was_stunned = false;
         shop();
         return;
     }
@@ -1685,12 +1646,6 @@ void Bot::play_turn() {
         team_memory::set_anchor(me.position(), hunting);
     if (me.is_recalling() || me.is_submitting_gems() || me.is_teleporting())
         return;
-
-    // A stun strips every allowance, so it only ever shows after the fact:
-    // remember it one turn for the bail check before the role turn.
-    const bool self_stunned = !me.can_move() && !me.can_attack() && !me.can_cast();
-    const bool stun_seen = self_stunned || was_stunned;
-    was_stunned = self_stunned;
 
     shop();
     if (survive())
@@ -1706,8 +1661,6 @@ void Bot::play_turn() {
         return;
     peel();
     place_lock();
-
-    bail_from_clump(stun_seen);
 
     switch (role) {
     case Role::tank: tank_turn(); break;
@@ -1731,9 +1684,8 @@ void Bot::tank_turn() {
 
     (void)nearest;
     const bool engage = !ctx.enemies.empty() && fighting_back();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
 
@@ -1773,9 +1725,8 @@ void Bot::fighter_turn() {
     // danger, an enemy is on top of her, or there is no camp to secure.
     (void)nearest;
     const bool engage = !ctx.enemies.empty() && fighting_back();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
 
@@ -1824,9 +1775,8 @@ void Bot::marksman_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
     const bool engage = !ctx.enemies.empty() && fighting_back();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
 
@@ -1838,11 +1788,8 @@ void Bot::marksman_turn() {
             cast_on(stun, *target);
         if (attack_enemies(ctx.enemies, reset))
             return;
-        if (target) {
-            const auto at = safe_pos(*target, me.position());
-            if (!spread(ctx, at, 2, 3))
-                keep_distance(at, 3, 3);
-        }
+        if (target)
+            keep_distance(safe_pos(*target, me.position()), 3, 3);
         return;
     }
 
@@ -1898,18 +1845,14 @@ void Bot::support_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
     const bool engage = !ctx.enemies.empty() && fighting_back();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
     const auto* attack_reset = healed ? nullptr : reset;
     if (engage) {
         if (attack_enemies(ctx.enemies, attack_reset))
             return;
-        if (const auto threat_target = top_threat(ctx.enemies))
-            if (spread(ctx, safe_pos(*threat_target, me.position()), 2, 3))
-                return;
         // Back line: near Ryth (or the team) but at least 4 tiles from enemies.
         const vec2 centre = ctx.anchor ? *ctx.anchor
             : (ctx.allies.empty() ? me.position() : ctx.allies.front().position());
@@ -1950,9 +1893,8 @@ void Bot::mage_turn() {
     // On 5-champion maps Prism opens the fight when hunting.
     (void)nearest;
     const bool engage = !ctx.enemies.empty() && fighting_back();
-    if (engage && outmatched(ctx.enemies, ctx.allies)
-        && nearest_enemy_distance(ctx.enemies, me.position()) <= 4) {
-        fall_back();
+    if (should_retreat(ctx)) {
+        retreat(ctx);
         return;
     }
 
@@ -1982,24 +1924,19 @@ void Bot::mage_turn() {
         }
         if (attack_enemies(ctx.enemies, nullptr))
             return;
-        if (const auto target = top_threat(ctx.enemies)) {
-            const auto at = safe_pos(*target, me.position());
-            if (!spread(ctx, at, 2, 4))
-                keep_distance(at, 2, 4);
-        }
+        if (const auto target = top_threat(ctx.enemies))
+            keep_distance(safe_pos(*target, me.position()), 2, 4);
         return;
     }
 
     // Farming: share cleared camps, hit camps the squad leader has woken, and
     // stay a step behind the leader so the camp targets the leader first.
-    // Squad B's objective camp waiting (cleared / respawning) parks only its
-    // owner — followers keep their side-farm detours, but the ring they hover
-    // on is masked off spawn tiles so nobody stalls the respawn it waits on.
-    const bool obj_wait = !squad_a && ctx.objective && !ctx.objective->hunt
-        && !park_alarmed() && group_waiting(ctx.objective->tile);
     if (join_capture())
         return;
-    if (farm_nearby_cluster(abilities, solo_cluster_radius))
+    // Early on Stellar stays with Ryth on camps that pay gold (gem clusters pay none).
+    const bool feeding = me.champion_name() == cambc::champion_type::stellar && game_phase() == Phase::early
+        && squad_a && ctx.anchor;
+    if (!feeding && farm_nearby_cluster(abilities, solo_cluster_radius))
         return;
     if (farm_nearby_wolf(abilities, squad_a ? ctx.anchor
                                             : (ctx.objective ? std::optional<vec2>(ctx.objective->tile) : std::nullopt)))
@@ -2013,11 +1950,7 @@ void Bot::mage_turn() {
     if (!squad_a && ctx.objective) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        auto hold = ring(ctx.objective->tile, ctx.hunt ? 3 : 2, ctx.hunt ? 5 : 3);
-        if (obj_wait)
-            if (const auto* g = group_at(ctx.objective->tile))
-                hold &= ~g->tiles;
-        step_towards(hold);
+        step_towards(ring(ctx.objective->tile, ctx.hunt ? 3 : 2, ctx.hunt ? 5 : 3));
         return;
     }
     if (farm_target) // the squad leader is dead or recalling: farm alone

@@ -18,13 +18,11 @@ class Bot {
     bool hunting = false;                   // Ryth: no camp to farm, squad hunts
     bool squad_a = true;                    // follows Ryth (A) or the objective (B)
     std::uint32_t enemy_seen_round = 0;     // last round an enemy champion was in sight
-    bool was_stunned = false;               // stunned on the previous turn
 
     void init();
     void shop();
     void track_damage();
     bool survive();
-    void bail_from_clump(bool stun_seen);
     bool bank();
     bool shopping_trip();
     bool fighting_back() const;
