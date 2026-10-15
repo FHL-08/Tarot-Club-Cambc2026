@@ -615,16 +615,6 @@ const EnemyObs* nearest_champ(const Obs& obs, const cambc::bitboard& attack_tile
     return best;
 }
 
-// Deterministic per-champ focus cadence: every champ_focus_n-th in-range
-// turn hits the champion (measured champ-share ~1/N, issue #93). Round +
-// slot parity keeps tactic::poke and this FSM on the same cadence without
-// shared state.
-bool focus_turn(std::uint32_t round)
-{
-    return (round + static_cast<std::uint32_t>(my_slot()))
-        % static_cast<std::uint32_t>(clone::champ_focus_n) == 0;
-}
-
 // Wait-signature fallback (issue #93): teams that never yield spend a
 // would-be Wait on work — poke any owned monster in reach, else drift to
 // the nearest objective's free tiles (group tiles first so a parked
@@ -816,15 +806,16 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     }
     catch (const std::exception&) { }
 
-    // Attack-on-sight (issue #93): the NEAREST enemy inside the attack
-    // ring is hit on the focus cadence — every champ_focus_n-th such turn;
-    // a target that steps out is chased for up to clone::chase_cap turns.
-    // Below the recall floor the pitstop owns the turn, so the whole
-    // block gates on it.
+    // Attack-on-sight (issue #93): an in-range enemy champion is always
+    // hit, nearest first — the measured ~10% champ-attack share is
+    // emergent (champs are in range that often), not a cadence. A target
+    // that steps out is chased for up to clone::chase_cap turns. Below
+    // the recall floor the pitstop owns the turn, so the whole block
+    // gates on it.
     if (obs.self_health >= obs.self_max_health * clone::recall_hp)
     {
         const EnemyObs* target = nullptr;
-        if (st.contains(cs::can_attack) && focus_turn(obs.round))
+        if (st.contains(cs::can_attack))
             target = nearest_champ(obs, turn::attack_tiles());
         if (target)
         {
@@ -1540,10 +1531,8 @@ bool exec::apply(const Action& action)
                 if (moved && me.can_attack())
                 {
                     const auto& attack_tiles = turn::attack_tiles();
-                    // Champ hits ride the same focus cadence as tick's
-                    // attack-on-sight (issue #93) — nearest champion on the
-                    // Nth turn, else the nav target's group only.
-                    if (focus_turn(cambc::round_number()))
+                    // Champion in range outranks the nav target's group —
+                    // the same attack-on-sight preference as tick.
                     {
                         cambc::vec2 hit{};
                         std::int64_t hit_d = std::numeric_limits<std::int64_t>::max();
@@ -1631,9 +1620,8 @@ bool exec::apply(const Action& action)
                 }
                 // An attack-reset cast restores the attack allowance it
                 // didn't consume (GameRules §Combat) — spend it on the
-                // nearest champion still in range, on the focus cadence.
-                if (abilities[a.slot].is_attack_reset() && me.can_attack()
-                    && focus_turn(cambc::round_number()))
+                // nearest champion still in range.
+                if (abilities[a.slot].is_attack_reset() && me.can_attack())
                 {
                     const auto& attack_tiles = turn::attack_tiles();
                     cambc::vec2 hit{};

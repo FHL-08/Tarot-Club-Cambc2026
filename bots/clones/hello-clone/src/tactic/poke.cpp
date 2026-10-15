@@ -2,32 +2,8 @@
 // spend the basic attack a turn already allows rather than waste it.
 #include "tactic.h"
 #include "support.h"
-#include "../clone_config.h"
 #include <cstdint>
 #include <limits>
-
-namespace {
-
-// This body's draft slot — the per-champ stagger on the focus cadence.
-int self_slot()
-{
-    static int slot = -1;
-    if (slot < 0)
-    {
-        try
-        {
-            const auto& me = turn::self();
-            const auto allies = cambc::champions(cambc::team::ally);
-            for (std::size_t i = 0; i < allies.size(); ++i)
-                if (allies[i] == me) { slot = static_cast<int>(i); break; }
-        }
-        catch (const std::exception&) { }
-        if (slot < 0) slot = 0;
-    }
-    return slot;
-}
-
-} // namespace
 
 std::optional<exec::Action> tactic::poke(const Obs& obs)
 {
@@ -49,10 +25,5 @@ std::optional<exec::Action> tactic::poke(const Obs& obs)
         { best_d = d; best = &e; }
     }
     if (!best) return std::nullopt;
-    // Champ-focus share (issue #93): only every champ_focus_n-th in-range
-    // turn takes the champion; the rest fall through to camp work.
-    if ((obs.round + static_cast<std::uint32_t>(self_slot()))
-        % static_cast<std::uint32_t>(clone::champ_focus_n) != 0)
-        return std::nullopt;
     return exec::Attack{ best->position, exec::Attack::Kind::champion };
 }

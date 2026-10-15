@@ -24,11 +24,6 @@ inline constexpr std::uint32_t ward_min_gap = 60;
 // Bank when the carried bag reaches this many gems.
 inline constexpr std::uint32_t trib_cap = 44;
 
-// Champion-focus share (issue #93): an enemy champion in the attack ring
-// takes the hit on every Nth in-range turn — measured ~1/N of attacks
-// land on champions. Targeting is nearest-in-range; lowest-hp% was a v1
-// misread (median attacked-target hp% ~0.5-0.6).
-inline constexpr int champ_focus_n = 11;
 // Wait signature (issue #93 v3): never = always take an action, drifting
 // to the nearest objective when idle; park = hold on the assigned group's
 // ring and yield only while its respawn sits within respawn_wait_rounds
