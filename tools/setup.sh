@@ -7,14 +7,15 @@ cd "$(dirname "$0")/.."
 
 command -v python3 >/dev/null || { echo "error: python3 is required (replay tools + version parsing)"; exit 1; }
 if ! command -v node >/dev/null || [ "$(node --version | sed 's/^v//; s/\..*//')" -lt 20 ]; then
-    echo "error: node >= 20 is required (tools/replay uses node:wasi); got: $(node --version 2>/dev/null || echo none)"
-    exit 1
+    echo "warning: node >= 20 needed for tools/replay (node:wasi); got: $(node --version 2>/dev/null || echo none)"
 fi
 
-case "$(uname -m)" in
-    x86_64|amd64) platform=linux-x64 ;;
-    aarch64|arm64) platform=linux-arm64 ;;
-    *) echo "error: unsupported architecture $(uname -m)"; exit 1 ;;
+case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64)   platform=linux-x64 ;;
+    Linux:aarch64|Linux:arm64)  platform=linux-arm64 ;;
+    Darwin:x86_64)              platform=macos-x64 ;;
+    Darwin:arm64|Darwin:aarch64) platform=macos-arm64 ;;
+    *) echo "error: unsupported platform $(uname -s)/$(uname -m)"; exit 1 ;;
 esac
 
 tmp=$(mktemp -d)
@@ -44,7 +45,14 @@ if [ "$current" = "$version" ]; then
 else
     echo "downloading cambc $version for $platform"
     curl -fsSL "$url" -o "$tmp/cambc.exe"
-    echo "$sha  $tmp/cambc.exe" | sha256sum -c -
+    python3 - "$sha" "$tmp/cambc.exe" <<'PY'
+import hashlib, sys
+want, path = sys.argv[1], sys.argv[2]
+got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+if got != want:
+    sys.exit(f"error: checksum mismatch for {path}: {got} != {want}")
+print(f"{path}: OK")
+PY
     chmod +x "$tmp/cambc.exe"
     mv "$tmp/cambc.exe" ./cambc.exe
     echo "installed cambc.exe $version"
