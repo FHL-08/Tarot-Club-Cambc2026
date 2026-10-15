@@ -86,11 +86,13 @@ struct Mem {
     int chase_left = 0;
     // Cast-fizzle watchdog: a use() that throws never starts the cooldown,
     // so `is_ready` stays true and the naive loop would re-emit the same
-    // fizzling cast every turn. Three consecutive strikes retire the slot.
+    // fizzling cast every turn. Three consecutive strikes park the slot
+    // for one cooldown — it retries on schedule instead of retiring
+    // (issue #93: the real teams' slots never permanently die).
     int last_cast_slot = -1;
     std::uint32_t last_cast_round = 0;
     std::uint8_t cast_strikes[2] = { 0, 0 };
-    bool cast_banned[2] = { false, false };
+    std::uint32_t cast_banned_until[2] = { 0, 0 };
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
@@ -350,7 +352,8 @@ int opening_stop(int index)
         cambc::bitboard visited;
         field.compute(hard, origin, visited);
         int best = -1;
-        float best_score = -1;
+        float best_cost = std::numeric_limits<float>::max();
+        std::uint64_t best_gems = 0;
         for (std::size_t g = 0; g < geos.size(); ++g)
         {
             if (used[g] || geos[g].gems <= 0 || geos[g].monolith) continue;
@@ -363,9 +366,29 @@ int opening_stop(int index)
                 travel = std::min(travel, field.get(tile));
             if (travel == cambc::distance_field::unreachable) continue;
             const float clear = geos[g].health / team_dps;
-            const float score = static_cast<float>(geos[g].gems)
-                / (static_cast<float>(travel) + clear);
-            if (score > best_score) { best_score = score; best = static_cast<int>(g); }
+            // The real openers point the ball at the camp it can hit
+            // first (issue #93): the FIRST stop ranks on time-to-first-gem
+            // — scoring gems/(travel+clear) there picked the richer camp
+            // ~5 rounds further out and pushed firstCapture past r25.
+            // Later stops keep the payout rate: spending the whole route
+            // on cheap camps starves the midgame economy.
+            if (stops.empty())
+            {
+                const float cost = static_cast<float>(travel) + clear;
+                if (best < 0 || cost < best_cost
+                    || (cost == best_cost && geos[g].gems > best_gems))
+                {
+                    best_cost = cost;
+                    best_gems = geos[g].gems;
+                    best = static_cast<int>(g);
+                }
+            }
+            else
+            {
+                const float score = static_cast<float>(geos[g].gems)
+                    / (static_cast<float>(travel) + clear);
+                if (score > best_cost) { best_cost = score; best = static_cast<int>(g); }
+            }
         }
         if (best < 0) { exhausted = true; break; }
         used[static_cast<std::size_t>(best)] = 1;
@@ -657,6 +680,15 @@ std::optional<exec::Action> drift_action(const Obs& obs, bool park_hold = false)
     }
     if (goals.is_empty())
     {
+        // Holding a tile of the drift group while every other is taken:
+        // stepping to the ring would vacate the footprint a pending
+        // capture is timing (issue #93 never-yield stall) — mark time on
+        // the spot; nav drops the self goal and the turn yields.
+        if (geos[g].tiles.is_set(pos))
+        {
+            goals.set(pos);
+            return exec::Move{ std::move(goals) };
+        }
         for (const auto tile : geos[g].tile_list) goals.draw_chebyshev(tile, 1);
         goals &= ~geos[g].tiles & ~blocked_tiles();
         goals.set(pos, false);
@@ -665,34 +697,143 @@ std::optional<exec::Action> drift_action(const Obs& obs, bool park_hold = false)
     return exec::Move{ std::move(goals) };
 }
 
-// A ready damage/cc payload on the engaged group out-damages a basic
-// swing, and stunned members skip their retaliation — the planner's kit
-// dps already prices this in (burst amortized over the 8-round cooldown),
-// so a runtime that never casts clears slower than the gate believes.
-// Restricted to the active target: focused-fire, never wake a bystander.
-std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
+// The fight cast for the engaged group (issue #93 cast rate): the real
+// teams run every slot near cooldown — a ready damage/cc payload hits
+// the pack, a shield or heal goes up while the fight is actually
+// hurting, and an attack reset buys a free second swing whenever a
+// member is already inside the attack ring (apply() lands the
+// follow-up). Damage stays restricted to the active target —
+// focused-fire, never wake a bystander — while sustain and resets are
+// safe to spend on cooldown.
+std::optional<exec::Cast> fight_cast(int g, const Obs& obs, bool poke_owned = false)
 {
     const auto& me = turn::self();
     if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
     const auto& abilities = turn::abilities();
+    const auto usable = [&](std::uint8_t slot) {
+        return obs.round >= mem.cast_banned_until[slot] && turn::slot_ready(slot);
+    };
+    const auto mark = [&](std::uint8_t slot) {
+        mem.last_cast_slot = slot;
+        mem.last_cast_round = obs.round;
+    };
     for (std::uint8_t slot = 0; slot < 2; ++slot)
     {
-        if (mem.cast_banned[slot]) continue;
+        if (!usable(slot)) continue;
         const auto& ab = abilities[slot];
-        if (!turn::slot_ready(slot) || (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()))
-            continue;
-        const bool ground = turn::slot_targets(slot).contains(cambc::ability_target_mask::ground);
-        if (!turn::slot_targets(slot).contains(cambc::ability_target_mask::camps) && !ground)
-            continue;
+        if (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()) continue;
+        const auto& targets = turn::slot_targets(slot);
+        const bool ground = targets.contains(cambc::ability_target_mask::ground);
+        const bool camps = targets.contains(cambc::ability_target_mask::camps);
+        const bool foes = targets.contains(cambc::ability_target_mask::enemies);
+        if (!camps && !ground && !foes) continue;
         const cambc::bitboard& tiles = turn::slot_reach(slot);
+        // champ-preference on the payload too: a visible hostile in reach
+        // takes the slot before any member of the engaged pack.
+        if (foes || ground)
+            for (const auto& e : visible_enemies())
+                if (e.is_visible() && e.health() > 0 && tiles.is_set(e.position()))
+                {
+                    mark(slot);
+                    return exec::Cast{ slot, e.position(), ground };
+                }
         for (const auto& c : visible_camps())
             if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos))
             {
-                mem.last_cast_slot = slot;
-                mem.last_cast_round = round;
+                mark(slot);
                 return exec::Cast{ slot, c.pos, ground };
             }
     }
+    // Unfocused payload: a member of a group we own spends the slot when
+    // the body already stands inside that pack's footprint, or whenever
+    // the call site is stationary (stands/parks — the round's fallback
+    // is Wait anyway). Commutes never poke: waking a pack en route to a
+    // different fight bought chip damage and eval losses (issue #93).
+    for (std::uint8_t slot = 0; slot < 2; ++slot)
+    {
+        if (!usable(slot)) continue;
+        const auto& ab = abilities[slot];
+        if (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()) continue;
+        const auto& targets = turn::slot_targets(slot);
+        const bool ground = targets.contains(cambc::ability_target_mask::ground);
+        if (!ground && !targets.contains(cambc::ability_target_mask::camps)) continue;
+        const cambc::bitboard& tiles = turn::slot_reach(slot);
+        for (const auto& c : visible_camps())
+            if (c.health > 0 && mine(group_of(c.spawn)) && tiles.is_set(c.pos)
+                && (poke_owned
+                    || (group_of(c.spawn) >= 0
+                        && groups()[group_of(c.spawn)].tiles.is_set(obs.self_pos))))
+            {
+                mark(slot);
+                return exec::Cast{ slot, c.pos, ground };
+            }
+    }
+    // A swing this turn outranks a sustain cast: only spend the slot
+    // below when nothing live sits inside the attack ring (the reset
+    // phase reuses the same in_range flag).
+    bool can_swing = turn::self_state().contains(cambc::champion_state::can_attack);
+    bool in_range = false;
+    const auto& attack_tiles = turn::attack_tiles();
+    for (const auto& e : visible_enemies())
+        if (e.is_visible() && e.health() > 0 && attack_tiles.is_set(e.position()))
+        { in_range = true; break; }
+    const int engaged = (g >= 0) ? g : mem.nav_pending;
+    for (const auto& c : visible_camps())
+        if (!in_range && c.health > 0 && group_of(c.spawn) == engaged
+            && attack_tiles.is_set(c.pos))
+        { in_range = true; break; }
+    // Sustain next — it only competes with the payload above for the
+    // turn's one cast, so spending it on cooldown while hurt is the
+    // measured behaviour and can never delay a real hit.
+    const float hurt = obs.self_max_health * 0.95f;
+    for (std::uint8_t slot = 0; slot < 2; ++slot)
+    {
+        if (!usable(slot)) continue;
+        const auto& ab = abilities[slot];
+        const auto& targets = turn::slot_targets(slot);
+        // Shield is a buff — it lands at any health, so it spends on
+        // cooldown when the arm has nothing to hit anyway; a heal at
+        // full health no-ops, so that one keeps the hurt gate.
+        if (ab.is_shield() && targets.contains(cambc::ability_target_mask::self)
+            && !(can_swing && in_range))
+        {
+            mark(slot);
+            return exec::Cast{ slot, obs.self_pos, false };
+        }
+        if (ab.is_heal() && targets.contains(cambc::ability_target_mask::allies))
+        {
+            const cambc::bitboard* tiles = nullptr;
+            try { tiles = &turn::slot_reach(slot); }
+            catch (const std::exception&) { continue; }
+            cambc::vec2 ally_pos{};
+            float worst = std::numeric_limits<float>::max();
+            for (const auto& ally : turn::allies())
+            {
+                // Willow's heal reads "another allied champion" — self is
+                // never a legal target even while bleeding alone.
+                if (ally.pos == obs.self_pos || !tiles->is_set(ally.pos)) continue;
+                const auto hp = turn::ally_health(ally);
+                const auto max_hp = turn::ally_max_health(ally);
+                if (hp && max_hp && *hp < *max_hp * 0.95f && *hp < worst)
+                { worst = *hp; ally_pos = ally.pos; }
+            }
+            if (worst < std::numeric_limits<float>::max())
+            {
+                mark(slot);
+                return exec::Cast{ slot, ally_pos, false };
+            }
+        }
+    }
+    // Attack reset last: it restores the swing it doesn't consume, so it
+    // only pays when an enemy or the engaged pack is already in reach —
+    // the same gate burst.cpp applies to champion targets.
+    if (can_swing && in_range)
+        for (std::uint8_t slot = 0; slot < 2; ++slot)
+        {
+            if (!usable(slot) || !abilities[slot].is_attack_reset()) continue;
+            mark(slot);
+            return exec::Cast{ slot, obs.self_pos, false };
+        }
     return std::nullopt;
 }
 
@@ -712,6 +853,36 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
 // cadence, now retired.
 exec::Action wait_or_move(State next, cambc::bitboard goals, const Obs& obs)
 {
+    // A ready dash covers up to two steps for the same turn — the real
+    // teams spend it on cooldown even mid-commute (issue #93), which is
+    // how their balls arrive early. The descent comparison lives in
+    // nav::best_dash; a miss falls through to the walk as before.
+    if (turn::self_state().contains(cambc::champion_state::can_cast))
+    {
+        const auto& abilities = turn::abilities();
+        for (std::uint8_t slot = 0; slot < 2; ++slot)
+        {
+            if (obs.round < mem.cast_banned_until[slot] || !turn::slot_ready(slot)
+                || !abilities[slot].is_dash()
+                || !turn::slot_targets(slot).contains(cambc::ability_target_mask::ground))
+                continue;
+            const cambc::bitboard* reach = nullptr;
+            try { reach = &turn::slot_reach(slot); }
+            catch (const std::exception&) { continue; }
+            if (const auto dest = nav::best_dash(goals, *reach))
+            {
+                mem.last_cast_slot = slot;
+                mem.last_cast_round = obs.round;
+                return done(next, exec::Cast{ slot, *dest, true }, obs);
+            }
+        }
+    }
+    // No dash that pays: a ready payload or sustain slot spends anyway —
+    // one round of commute for a cast on cooldown is the measured spam
+    // (issue #93). The engaged group rides nav_pending; -1 keeps it to
+    // enemy/sustain/reset phases plus in-footprint pokes.
+    if (const auto cast = fight_cast(mem.nav_pending, obs))
+        return done(next, *cast, obs);
     return done(next, exec::Move{ std::move(goals) }, obs);
 }
 
@@ -782,7 +953,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             {
                 if (turn::slot_ready(static_cast<std::uint32_t>(s)))
                 {
-                    if (++mem.cast_strikes[s] >= 3) mem.cast_banned[s] = true;
+                    // Cooldown-aware retry (issue #93): park the slot for
+                    // one cooldown and let it try again — a permanent ban
+                    // was silently zeroing reset/dash kits' cast counts.
+                    if (++mem.cast_strikes[s] >= 3)
+                    {
+                        mem.cast_banned_until[s] = obs.round + 8;
+                        mem.cast_strikes[s] = 0;
+                    }
                 }
                 else
                     mem.cast_strikes[s] = 0;
@@ -925,6 +1103,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 // stop poking — but an enemy champion in reach does.
                 if (!(threat && obs.self_health < obs.self_max_health * 0.75f))
                 {
+                    // Ready slots still spend — sustain/reset/hostile shots
+                    // don't move the body, so the stand keeps timing.
+                    if (const auto cast = fight_cast(here, obs, true))
+                        return done(State::capture, *cast, obs);
                     const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
@@ -940,6 +1122,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 const bool grace = static_cast<std::int32_t>(obs.round) - mem.contested_since <= cambc::constants::capture_time + 1;
                 if (grace && !unsafe)
                 {
+                    if (const auto cast = fight_cast(here, obs, true))
+                        return done(State::capture, *cast, obs);
                     const auto& attack_tiles = turn::attack_tiles();
                     if (const auto hit = attack_in_range(attack_tiles, -1, true))
                         return done(State::capture, *hit, obs);
@@ -1019,6 +1203,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
         if (at_spawn)
         {
+            // Ready slots still spend while the spawn heals (issue #93).
+            if (const auto cast = fight_cast(-1, obs, true))
+                return done(State::pitstop, *cast, obs);
             if (clone::yield_mode == clone::YieldMode::never)
                 if (const auto drift = drift_action(obs))
                     return done(State::pitstop, *drift, obs);
@@ -1039,6 +1226,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             mem.recall_pending = true;
             return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
         }
+        // A hurt walk home still spends ready slots — sustain is exactly
+        // what a pitstop body needs, and a pursuer in reach eats the
+        // payload (issue #93).
+        if (const auto cast = fight_cast(-1, obs, true))
+            return done(State::pitstop, *cast, obs);
         return done(State::pitstop, Move{ turn::spawn_region(cambc::team::ally) }, obs);
     }
 
@@ -1099,6 +1291,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (locked_d <= cambc::constants::submit_gems_range)
             return done(State::bank, Channel{ Channel::Kind::tribute, locked }, obs);
         rings &= ~blocked;
+        if (const auto cast = fight_cast(-1, obs, true))
+            return done(State::bank, *cast, obs);
         if (!rings.is_empty()) // every approach tile occupied: bank later
             return done(State::bank, Move{ std::move(rings) }, obs);
     }
@@ -1374,10 +1568,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             mem.nav_pending = target;
             return wait_or_move(State::travel, std::move(free_tiles), obs);
         }
-        // Alive (or believed): hit the target already in range — focused
-        // fire, so a passerby group never gets woken on the way in —
-        // else descend to a free tile inside our own attack ring.
-        if (const auto cast = camp_cast(target, obs.round))
+        // Alive (or believed): cast what the kit offers, else hit the
+        // target already in range — focused fire, so a passerby group
+        // never gets woken on the way in — else descend to a free tile
+        // inside our own attack ring. nav_pending is set for every
+        // action kind so apply()'s post-cast and post-move follow-ups
+        // read the same engaged group.
+        mem.nav_pending = target;
+        if (const auto cast = fight_cast(target, obs))
             return done(State::clear, *cast, obs);
         const auto& attack_tiles = turn::attack_tiles();
         if (const auto hit = attack_in_range(attack_tiles, target))
@@ -1390,7 +1588,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         goals &= ~blocked;
         if (goals.is_empty()) goals = geos[target].tiles & ~blocked; // rings sealed off: walk onto the tiles
         if (goals.is_empty()) goals = geos[target].tiles;
-        mem.nav_pending = target;
         return wait_or_move(State::travel, std::move(goals), obs);
     }
 
@@ -1439,6 +1636,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         for (const auto& e : obs.enemies)
             if (e.health > 0 && pos.chebyshev_distance(e.position) <= 5)
             { enemy_near = true; break; }
+        if (const auto cast = fight_cast(haul, obs, true))
+            return done(State::haul, *cast, obs);
         if (clone::yield_mode == clone::YieldMode::never
             || (clone::yield_mode == clone::YieldMode::park
                 && (!parked_eta || enemy_near)))
@@ -1465,6 +1664,8 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     // legitimately idle.
     // Idle work for never and park alike — park yields only inside the
     // footprint (the haul block above), so an idle body drifts instead.
+    if (const auto cast = fight_cast(-1, obs, true))
+        return done(State::idle, *cast, obs);
     if (const auto drift = drift_action(obs,
             clone::yield_mode == clone::YieldMode::park))
         return done(State::idle, *drift, obs);
@@ -1604,23 +1805,58 @@ bool exec::apply(const Action& action)
                     try { return abilities[a.slot].use(a.target); }
                     catch (const cambc::error&) { return false; }
                 }
-                try
+                // A self-targeted slot resolves through the no-arg use() —
+                // neither entity lookup below can see our own tile, so the
+                // old path fizzled every reset/self-shield cast it got
+                // (each counted toward the strike watchdog's ban).
+                if (a.target == me.position()
+                    && turn::slot_targets(a.slot).contains(cambc::ability_target_mask::self))
                 {
-                    const auto* enemy = turn::enemy_at(a.target);
-                    if (!enemy)
-                        throw cambc::error{ cambc::error_code::api_not_in_vision,
-                            "tile emptied between tick and apply" };
-                    if (!abilities[a.slot].use(*enemy))
-                        return false;
-                }
-                catch (const cambc::error&)
-                {
-                    try { return abilities[a.slot].use(cambc::vision::camp_at(a.target)); }
+                    try { if (!abilities[a.slot].use()) return false; }
                     catch (const cambc::error&) { return false; }
+                }
+                else
+                {
+                    // Ally-targeted slots (heals) — the enemy/camp lookup
+                    // can't see our own ball either. A enemies|allies mask
+                    // aimed at a hostile falls through to the enemy path.
+                    bool done_cast = false;
+                    if (turn::slot_targets(a.slot).contains(cambc::ability_target_mask::allies))
+                    {
+                        const turn::AllyLive* ally = nullptr;
+                        for (const auto& al : turn::allies())
+                            if (al.pos == a.target) { ally = &al; break; }
+                        if (ally)
+                        {
+                            try { if (!abilities[a.slot].use(ally->handle)) return false; }
+                            catch (const cambc::error&) { return false; }
+                            done_cast = true;
+                        }
+                    }
+                    if (!done_cast)
+                    {
+                        try
+                        {
+                            const auto* enemy = turn::enemy_at(a.target);
+                            if (!enemy)
+                                throw cambc::error{ cambc::error_code::api_not_in_vision,
+                                    "tile emptied between tick and apply" };
+                            if (!abilities[a.slot].use(*enemy))
+                                return false;
+                        }
+                        catch (const cambc::error&)
+                        {
+                            try { return abilities[a.slot].use(cambc::vision::camp_at(a.target)); }
+                            catch (const cambc::error&) { return false; }
+                        }
+                    }
                 }
                 // An attack-reset cast restores the attack allowance it
                 // didn't consume (GameRules §Combat) — spend it on the
-                // nearest champion still in range.
+                // nearest champion still in range, else the engaged
+                // pack's weakest member (fight_cast only emits the reset
+                // when one is already in reach). 'pack' widened to any
+                // owned member so a parked poke lands the follow-up too.
                 if (abilities[a.slot].is_attack_reset() && me.can_attack())
                 {
                     const auto& attack_tiles = turn::attack_tiles();
@@ -1637,11 +1873,31 @@ bool exec::apply(const Action& action)
                         }
                         catch (const cambc::error&) { continue; } // stale entity — skip this turn
                     if (hit_d < std::numeric_limits<std::int64_t>::max())
+                    {
                         if (const auto* enemy = turn::enemy_at(hit))
                         {
                             try { me.attack(*enemy); }
                             catch (const cambc::error&) { }
                         }
+                    }
+                    else
+                    {
+                        // Weakest reachable member of the engaged pack —
+                        // poking a pack we merely own (not engaged) wakes
+                        // it and buys chip damage for nothing (issue #93
+                        // eval regression).
+                        const LiveCamp* victim = nullptr;
+                        for (const auto& c : visible_camps())
+                            if (c.health > 0 && attack_tiles.is_set(c.pos)
+                                && group_of(c.spawn) == mem.nav_pending
+                                && (!victim || c.health < victim->health))
+                                victim = &c;
+                        if (victim)
+                        {
+                            try { me.attack(victim->handle); }
+                            catch (const cambc::error&) { }
+                        }
+                    }
                 }
                 return true;
             }
@@ -1701,6 +1957,8 @@ void exec::warm_statics()
         if (!did) break;
     }
     if (cambc::fuel_remaining() >= headroom) tactic::groups();
+    if (cambc::fuel_remaining() >= headroom) group_at();
+    if (cambc::fuel_remaining() >= headroom) my_dps();
     if (cambc::fuel_remaining() >= headroom) tactic::altars();
     if (cambc::fuel_remaining() >= headroom) turn::altars();
     if (cambc::fuel_remaining() >= headroom) econ::warm();

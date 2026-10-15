@@ -11,6 +11,7 @@
 // descent retries alternative steps. cambc::error from a known-illegal
 // destination propagates — nav never swallows engine errors.
 #include <cambc.h>
+#include <optional>
 
 namespace nav {
 
@@ -23,5 +24,13 @@ bool step(const cambc::bitboard& goals);
 
 // Move toward a single tile; equivalent to step() on a one-tile board.
 bool step_towards(cambc::vec2 target);
+
+// Best dash destination toward the same goals: the cast spends the turn's
+// one move to cover up to `range` tiles, so it is only worth firing when
+// the destination strictly out-descends every tile a walk could reach.
+// Empty when walking is at least as good — the caller then emits the
+// Move and pays for the field a second time on dash-ready turns only.
+std::optional<cambc::vec2> best_dash(const cambc::bitboard& goals,
+    const cambc::bitboard& reach);
 
 } // namespace nav
