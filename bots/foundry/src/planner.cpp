@@ -49,9 +49,14 @@ Kit kit_for(cambc::champion_type type)
     kit.health = stats.base_health;
     kit.speed = std::max(1, stats.base_move_speed);
     const float basic = stats.base_strength * stats.camp_damage_multiplier;
-    // Spell output amortised over the 8-turn slot cooldown: casters bring a
-    // ~2x-focus nuke, melee kits an attack reset worth one extra basic.
-    const float burst = stats.base_attack_range > 1 ? 2.0f * stats.base_focus : basic;
+    // Spell output amortised over the 8-turn slot cooldown, but only when a
+    // real damage slot exists — attack_reset/heal kits (exec's my_dps fix,
+    // #25) cast nothing at camps, so crediting them phantom burst misranks
+    // their clear times.
+    float burst = 0;
+    for (const auto& ab : cambc::champion{ type }.abilities())
+        if (ab.is_damage() || ab.is_aoe_damage())
+            burst = stats.base_attack_range > 1 ? 2.0f * stats.base_focus : basic;
     kit.dps = basic + burst / 8.0f;
     return kit;
 }
