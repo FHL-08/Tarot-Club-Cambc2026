@@ -38,6 +38,16 @@ constexpr int join_capture_range = 6;
 // Fall back instead of fighting when nearby enemies are this much stronger.
 constexpr float outmatched_ratio = 1.3f;
 
+// A camp back from respawn within this many rounds of our arrival stays a
+// farm target (Mite measured ~20): the wait is priced into its turns, so a
+// nearby respawn beats a long walk and the farmer yields parked on its ring.
+constexpr int park_window = 20;
+
+// A champ that owns a cleared camp holds it through the respawn — the elk's
+// 60 is the longest non-monolith wait — yielding on its ring instead of
+// drifting to the next objective early (issue #112).
+constexpr int park_hold = 61;
+
 
 namespace {
 
@@ -639,6 +649,12 @@ std::vector<int>& taken_until() {
     return taken;
 }
 
+// A parked champ leaves its wait on a fight/danger alarm — the normal
+// retarget-and-fight path takes over (issue #112).
+bool park_alarmed() {
+    return team_memory::fight_alarm() || team_memory::danger_alarm();
+}
+
 // Is any of the group's spawn tiles in vision? Checks its few tiles instead of
 // intersecting two full-map bitboards (that cost ~34k fuel a turn on lanes).
 bool group_in_view(const GroupInfo& g, const bitboard& visible) {
@@ -670,6 +686,25 @@ void update_ledger() {
     }
 }
 
+// The group's monsters are all down with capture or respawn still pending —
+// believed respawning, or in view and no longer alive. A squad objective in
+// this state is a wait to park through, not a target to leave (issue #112).
+bool group_waiting(vec2 tile) {
+    const auto* g = group_at(tile);
+    if (!g)
+        return false;
+    const auto i = static_cast<std::size_t>(g - groups().data());
+    if (ready_round()[i] > static_cast<int>(cambc::round_number()))
+        return true;
+    if (!group_in_view(*g, cambc::vision::visible_tiles()))
+        return false;
+    try {
+        return !std::holds_alternative<cambc::map::camp_group_alive>(g->group.state());
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // Pick the camp group worth the most gems (plus a little gold) per turn spent
 // walking there, clearing it and capturing it. The monolith hits too hard to
 // be worth it unless nothing else is left, the group in `exclude` (the other
@@ -677,8 +712,34 @@ void update_ledger() {
 // clearly better.
 std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
                                 std::optional<vec2> exclude = std::nullopt, bool wolves = false,
-                                int helpers = -1) {
+                                int helpers = -1, int park_keep = 0) {
     const int round = static_cast<int>(cambc::round_number());
+    // camp-park (issue #112): an assigned camp in a respawn wait stays the
+    // objective when waiting beats rotating — the champ holds its ring and
+    // yields instead of drifting to the next objective early. Imminent
+    // respawns always park; longer waits park only when every ready camp
+    // already costs more turns to reach and take than sitting here.
+    if (current && park_keep > 0 && !park_alarmed())
+        if (const auto* g = group_at(*current)) {
+            const auto i = static_cast<std::size_t>(g - groups().data());
+            const int wait = ready_round()[i] - round;
+            if (!g->monolith && wait > 0 && wait <= park_keep) {
+                int alt = std::numeric_limits<int>::max();
+                for (std::size_t j = 0; j < groups().size(); ++j) {
+                    const auto& o = groups()[j];
+                    if (j == i || o.monolith || taken_until()[j] > round
+                        || ready_round()[j] > round)
+                        continue;
+                    int dj = 1000;
+                    for (const auto p : o.spawns)
+                        dj = std::min(dj, dist(from, p));
+                    alt = std::min(alt, dj + o.health / 250
+                            + static_cast<int>(cambc::constants::capture_time));
+                }
+                if (wait <= park_window || wait <= alt + 10)
+                    return current;
+            }
+        }
     // Health of the champion who will take the camp's hits (only checked when
     // the leader has nobody near to help).
     float my_health = 0;
@@ -712,16 +773,18 @@ std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
                 d = dist(from, p);
                 closest = p;
             }
-        // Still respawning when we would arrive: not a target yet.
+        // Still respawning when we would arrive: not a target yet — unless the
+        // wait fits park_window, in which case parking for it stays a candidate.
         const int wait = ready_round()[i] - round - d;
         if (wait > 0) {
             if (!g.monolith && wait < soonest_wait) {
                 soonest_wait = wait;
                 soonest = closest;
             }
-            continue;
+            if (g.monolith || wait > park_keep || park_alarmed())
+                continue;
         }
-        const double turns = d + g.health / 250.0 + cambc::constants::capture_time;
+        const double turns = d + std::max(wait, 0) + g.health / 250.0 + cambc::constants::capture_time;
         // Gems win the game; a gold-only camp is filler, picked only when no
         // gem camp is available (value 0 still beats "nothing").
         double value = g.gems / turns;
@@ -1317,7 +1380,7 @@ void Bot::choose_objective() {
         helpers += dist(safe_pos(a, vec2{-100, -100}), here) <= 5;
     switch (role) {
     case Role::fighter:
-        farm_target = choose_camp(here, farm_target, std::nullopt, false, helpers);
+        farm_target = choose_camp(here, farm_target, std::nullopt, false, helpers, park_hold);
         if (farm_target)
             team_memory::set_objective(*farm_target, false);
         else
@@ -1327,7 +1390,7 @@ void Bot::choose_objective() {
         std::optional<vec2> exclude;
         if (vendetta_camp && !vendetta_camp->hunt)
             exclude = vendetta_camp->tile;
-        farm_target = choose_camp(here, farm_target, exclude, false, helpers);
+        farm_target = choose_camp(here, farm_target, exclude, false, helpers, park_window);
         hunting = !farm_target;
         break;
     }
@@ -1337,7 +1400,8 @@ void Bot::choose_objective() {
         break; // farmer_turn picks its own camps
     case Role::mage: {
         const bool leader_heard = squad_a ? team_memory::anchor().has_value() : vendetta_camp.has_value();
-        farm_target = leader_heard ? std::nullopt : choose_camp(here, farm_target);
+        farm_target = leader_heard ? std::nullopt
+                                   : choose_camp(here, farm_target, std::nullopt, false, -1, park_hold);
         break;
     }
     }
@@ -1392,6 +1456,37 @@ bool Bot::farm_nearby_wolf(const Abilities& abilities, std::optional<vec2> leade
 std::optional<vec2> choose_solo_camp(vec2 from, std::optional<vec2> current, std::optional<vec2> avoid_a,
                                      std::optional<vec2> avoid_b) {
     const int round = static_cast<int>(cambc::round_number());
+    // camp-park (issue #112): a solo farmer parks on its camp when waiting
+    // beats the walk to the next cluster, same rule as the squad's keep.
+    if (current && !park_alarmed())
+        if (const auto* g = group_at(*current)) {
+            const auto i = static_cast<std::size_t>(g - groups().data());
+            const int wait = ready_round()[i] - round;
+            if (!g->monolith && wait > 0 && wait <= park_hold) {
+                int alt = std::numeric_limits<int>::max();
+                for (std::size_t j = 0; j < groups().size(); ++j) {
+                    const auto& o = groups()[j];
+                    if (j == i || o.gems == 0 || o.monolith
+                        || (!o.passive && o.strength > 20)
+                        || taken_until()[j] > round || ready_round()[j] > round)
+                        continue;
+                    int dj = 1000;
+                    vec2 closest{};
+                    for (const auto p : o.spawns)
+                        if (dist(from, p) < dj) {
+                            dj = dist(from, p);
+                            closest = p;
+                        }
+                    if ((avoid_a && dist(*avoid_a, closest) <= 3)
+                        || (avoid_b && dist(*avoid_b, closest) <= 3))
+                        continue;
+                    alt = std::min(alt, dj + o.health / 100
+                            + static_cast<int>(cambc::constants::capture_time));
+                }
+                if (wait <= park_window || wait <= alt + 10)
+                    return current;
+            }
+        }
     std::optional<vec2> best, soonest;
     double best_value = -1;
     int soonest_wait = std::numeric_limits<int>::max();
@@ -1415,9 +1510,10 @@ std::optional<vec2> choose_solo_camp(vec2 from, std::optional<vec2> current, std
                 soonest_wait = wait;
                 soonest = closest;
             }
-            continue;
+            if (wait > park_hold || park_alarmed())
+                continue;
         }
-        double value = g.gems / (d + g.health / 100.0 + cambc::constants::capture_time);
+        double value = g.gems / (d + std::max(wait, 0) + g.health / 100.0 + cambc::constants::capture_time);
         if (is_current)
             value *= stick_bonus;
         if (value > best_value) {
@@ -1896,6 +1992,11 @@ void Bot::mage_turn() {
 
     // Farming: share cleared camps, hit camps the squad leader has woken, and
     // stay a step behind the leader so the camp targets the leader first.
+    // Squad B's objective camp waiting (cleared / respawning) parks only its
+    // owner — followers keep their side-farm detours, but the ring they hover
+    // on is masked off spawn tiles so nobody stalls the respawn it waits on.
+    const bool obj_wait = !squad_a && ctx.objective && !ctx.objective->hunt
+        && !park_alarmed() && group_waiting(ctx.objective->tile);
     if (join_capture())
         return;
     if (farm_nearby_cluster(abilities, solo_cluster_radius))
@@ -1912,7 +2013,11 @@ void Bot::mage_turn() {
     if (!squad_a && ctx.objective) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        step_towards(ring(ctx.objective->tile, ctx.hunt ? 3 : 2, ctx.hunt ? 5 : 3));
+        auto hold = ring(ctx.objective->tile, ctx.hunt ? 3 : 2, ctx.hunt ? 5 : 3);
+        if (obj_wait)
+            if (const auto* g = group_at(ctx.objective->tile))
+                hold &= ~g->tiles;
+        step_towards(hold);
         return;
     }
     if (farm_target) // the squad leader is dead or recalling: farm alone
