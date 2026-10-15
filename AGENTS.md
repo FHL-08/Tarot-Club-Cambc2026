@@ -49,6 +49,7 @@ Use this language when talking about the game and the repo:
 The toolchain (WASI SDK, cmake, ninja) lives in `~/.cache/cambc` — installed by
 `./cambc.exe init`, refreshed by re-running it.
 
+- `tools/setup.sh`: fresh machine (incl. Devin Cloud, via .devin/blueprint.yaml): downloads the checksum-verified cambc.exe, installs the toolchain, and runs a smoke match. Re-run after a cambc release.
 - `./cambc.exe new <name> --lang cpp` — scaffold a bot into `bots/<name>/`.
 - `./cambc.exe build <name>` — compile the bot to a WASI module.
 - `./cambc.exe run <bot_a> <bot_b> --map <name> --statistics <out.json>` —
