@@ -925,25 +925,61 @@ bool protect_escape(bool escape_failed = false)
     return false;
 }
 
+// Spend a ready disable on a committed target before the basic hit lands:
+// chained stuns win the trade that a string of basics never does (issue
+// #103). A target already stunned makes the cast a waste, so basics go
+// through instead; a landed disable consumes the attack offer entirely.
+bool disable_first(cambc::vec2 target)
+{
+    const auto& me = turn::self();
+    if (!me.can_cast() || turn::enemy_stunned(target).value_or(false)) return false;
+    const auto& abilities = turn::abilities();
+    for (std::uint32_t s = 0; s < 2; ++s)
+    {
+        const auto& ab = abilities[s];
+        if (!ab.info() || !ab.is_cc() || !turn::slot_ready(s)
+            || !turn::slot_reach(s).is_set(target)) continue;
+        const bool ground = turn::slot_targets(s).contains(cambc::ability_target_mask::ground)
+            && !turn::slot_targets(s).contains(cambc::ability_target_mask::enemies);
+        try {
+            if (ground)
+            {
+                if (ab.use(target)) { turn::note_moved(); return true; }
+                continue;
+            }
+            if (const auto* enemy = turn::enemy_at(target);
+                enemy && ab.use(*enemy)) { turn::note_moved(); return true; }
+        } catch (const cambc::error&) { /* slot went stale — try the other */ }
+    }
+    return false;
+}
+
 // Spend a legal basic hit on a visible nearby attacker, without chasing it
 // (v17 follow_enemy_attack). Copy a tile before invalidating caches:
-// references into visible_enemies() must not survive a fresh query.
+// references into visible_enemies() must not survive a fresh query. A
+// stunned target outranks lower health — converging on the body a
+// teammate already disabled is what makes focus fire emerge (issue #103).
 bool follow_enemy_attack()
 {
     const auto& me = turn::self();
     if (cambc::fuel_remaining() < 18000 || !me.can_attack()) return false;
     const auto tiles = turn::attack_tiles();
     std::optional<cambc::vec2> target;
+    bool target_stunned = false;
     float lowest_hp = std::numeric_limits<float>::max();
     for (const auto& enemy : visible_enemies())
         try {
             if (!enemy.is_visible()) continue;
             const float hp = enemy.health();
             const auto p = enemy.position();
-            if (hp > 0 && hp < lowest_hp && tiles.is_set(p))
-            { lowest_hp = hp; target = p; }
+            if (hp <= 0 || !tiles.is_set(p)) continue;
+            const bool stunned = turn::enemy_stunned(p).value_or(false);
+            if (!target || (stunned && !target_stunned)
+                || (stunned == target_stunned && hp < lowest_hp))
+            { lowest_hp = hp; target_stunned = stunned; target = p; }
         } catch (const cambc::error&) { /* a stale enemy is not a valid hit */ }
     if (!target) return false;
+    if (disable_first(*target)) return true;
     try {
         if (const auto* enemy = turn::enemy_at(*target);
             enemy && enemy->is_visible() && enemy->health() > 0)
@@ -1121,8 +1157,30 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     bool threat = false;
     for (const auto& e : obs.enemies)
         if (pos.chebyshev_distance(e.position) <= 3) { threat = true; break; }
+
+    // Fight shape (issue #103): allies packed inside Chebyshev 2 can be
+    // covered by a single radius-1 area disable centred between them, so a
+    // stun landing on any one body of a clump means the whole blob is
+    // compromised — bail the fight through the normal unsafe path rather
+    // than keep trading into the chain.
+    int clumped = 0;
+    bool clump_stunned = false;
+    for (const auto& ally : turn::allies())
+    {
+        if (ally.pos == pos || pos.chebyshev_distance(ally.pos) > 2) continue;
+        ++clumped;
+        try { clump_stunned = clump_stunned || ally.handle.buffs().has_stun(); }
+        catch (const cambc::error&) { }
+    }
+    // The same check on this body: losing every allowance mid-fight is the
+    // stun state (GameRules §Buffs) even before any ally's buffs resolve.
+    const bool self_stunned = !turn::self_state().contains(cambc::champion_state::can_move)
+        && !turn::self_state().contains(cambc::champion_state::can_attack)
+        && !turn::self_state().contains(cambc::champion_state::can_cast);
+
     const bool dying = obs.self_health < obs.self_max_health * retreat_floor;
-    const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.75f);
+    const bool unsafe = dying || (threat && obs.self_health < obs.self_max_health * 0.75f)
+        || (threat && clumped >= 2 && (clump_stunned || self_stunned));
 
     // A recall we emitted that never shows in champion_state was cancelled
     // by damage/stun between turns; a completed one lands on spawn.
@@ -1260,6 +1318,48 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         Move escape{ turn::spawn_region(cambc::team::ally) };
         escape.escaping = true;
         return done(State::pitstop, escape, obs);
+    }
+
+    // Spread under pressure (issue #103): a clump farming our own camp
+    // with an enemy closing is one area-disable from a wipe — orbit the
+    // group's ring to tiles at least three apart so no stun covers two
+    // bodies, and far enough from the enemy that stepping in still costs
+    // them their turn.
+    if (here >= 0 && mine(here) && clumped >= 2)
+    {
+        bool closing = threat;
+        if (!closing)
+            for (const auto& e : obs.enemies)
+                if (pos.chebyshev_distance(e.position) <= 5) { closing = true; break; }
+        if (closing)
+        {
+            const auto& region = geos[static_cast<std::size_t>(here)].tiles;
+            cambc::bitboard zone = region;
+            for (const auto t : region.positions())
+            {
+                cambc::bitboard rim;
+                rim.draw_chebyshev(t, 1.0f);
+                zone |= rim;
+            }
+            zone &= ~blocked_tiles();
+            cambc::bitboard spread;
+            for (const auto t : zone.positions())
+            {
+                bool open = true;
+                for (const auto& ally : turn::allies())
+                    if (ally.pos != pos && t.chebyshev_distance(ally.pos) < 3)
+                    { open = false; break; }
+                if (open)
+                    for (const auto& e : obs.enemies)
+                        if (t.chebyshev_distance(e.position) < 2) { open = false; break; }
+                if (open) spread.set(t);
+            }
+            if (!spread.is_empty())
+            {
+                std::cout << "EXEC spread: orbit @r" << obs.round << '\n';
+                return done(State::idle, exec::Move{ std::move(spread) }, obs);
+            }
+        }
     }
 
     const auto blocked = blocked_tiles();
@@ -1867,14 +1967,19 @@ bool exec::apply(const Action& action)
                     const auto& attack_tiles = turn::attack_tiles();
                     float best_health = 0;
                     bool found = false;
+                    bool best_stunned = false;
                     cambc::vec2 hit{};
                     for (const auto& e : visible_enemies())
                     {
                         if (!e.is_visible() || e.health() <= 0
                             || !attack_tiles.is_set(e.position())) continue;
-                        if (!found || e.health() < best_health)
-                        { hit = e.position(); best_health = e.health(); found = true; }
+                        const bool stunned = turn::enemy_stunned(e.position()).value_or(false);
+                        if (!found || (stunned && !best_stunned)
+                            || (stunned == best_stunned && e.health() < best_health))
+                        { hit = e.position(); best_health = e.health();
+                          best_stunned = stunned; found = true; }
                     }
+                    if (found && disable_first(hit)) return true;
                     if (found)
                         if (const auto* enemy = turn::enemy_at(hit))
                         {
@@ -1907,6 +2012,7 @@ bool exec::apply(const Action& action)
                     }
                     catch (const cambc::error&) { /* stale target: fall through to champion */ }
                 }
+                else if (disable_first(a.target)) return true; // committed champ hit: stun first
                 try
                 {
                     const auto* enemy = turn::enemy_at(a.target);
@@ -1969,15 +2075,21 @@ bool exec::apply(const Action& action)
                     const auto& attack_tiles = turn::attack_tiles();
                     cambc::vec2 hit{};
                     float hit_hp = std::numeric_limits<float>::max();
+                    bool hit_stunned = false;
                     for (const auto& e : visible_enemies())
                         try
                         {
                             if (!e.is_visible() || !attack_tiles.is_set(e.position())) continue;
                             const float hp = e.health();
-                            if (hp > 0 && hp < hit_hp) { hit_hp = hp; hit = e.position(); }
+                            const bool stunned = turn::enemy_stunned(e.position()).value_or(false);
+                            if (hp <= 0) continue;
+                            if (hit_hp == std::numeric_limits<float>::max()
+                                || (stunned && !hit_stunned)
+                                || (stunned == hit_stunned && hp < hit_hp))
+                            { hit_hp = hp; hit_stunned = stunned; hit = e.position(); }
                         }
                         catch (const cambc::error&) { continue; } // stale entity — skip this turn
-                    if (hit_hp < std::numeric_limits<float>::max())
+                    if (hit_hp < std::numeric_limits<float>::max() && !disable_first(hit))
                         if (const auto* enemy = turn::enemy_at(hit))
                         {
                             try { me.attack(*enemy); }

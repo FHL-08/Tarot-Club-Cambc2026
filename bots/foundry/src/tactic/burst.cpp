@@ -94,6 +94,9 @@ std::optional<exec::Action> tactic::burst(const Obs& obs)
     auto better_target = [](const Target& a, const Target* b) {
         if (!b) return true;
         if (a.channelling != b->channelling) return a.channelling;
+        // A stunned body outranks lower health: converging on the target a
+        // teammate already disabled is what makes focus fire emerge (#103).
+        if (a.stunned != b->stunned) return a.stunned;
         if (a.health != b->health) return a.health < b->health;
         return a.gems > b->gems;
     };
