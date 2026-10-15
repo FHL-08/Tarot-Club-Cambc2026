@@ -10,8 +10,10 @@
 //   byte 2    objective stamp, +128 when hunting
 //   byte 3-4  Ryth's position (his squad's anchor)
 //   byte 5    Ryth stamp, +128 when his squad is hunting
-//   byte 6    fight alarm stamp: Ryth was attacked, or the team initiated
-//   byte 7    danger alarm stamp: a teammate is hurt and under attack
+//   byte 6    fight alarm stamp: Ryth was attacked, or the team initiated;
+//             +128 once Stellar or Varg owns an emblem (mid game)
+//   byte 7    danger alarm stamp: a teammate is hurt and under attack;
+//             +128 once Stellar owns three emblems (late game)
 //
 // A stamp is round % 120 + 1, so 0 means "never written" and age() can tell
 // how many rounds ago a message was written.
@@ -77,9 +79,14 @@ inline void set_anchor(cambc::vec2 tile, bool hunt) {
 }
 
 inline bool fight_alarm(int max_age = 4) { return age(get(6)) <= max_age; }
-inline void raise_fight() { put(6, now()); }
+inline void raise_fight() { put(6, static_cast<std::uint8_t>(now() | (get(6) & 128))); }
 
 inline bool danger_alarm(int max_age = 4) { return age(get(7)) <= max_age; }
-inline void raise_danger() { put(7, now()); }
+inline void raise_danger() { put(7, static_cast<std::uint8_t>(now() | (get(7) & 128))); }
+
+inline bool mid_game() { return (get(6) & 128) != 0; }
+inline void set_mid_game() { put(6, static_cast<std::uint8_t>(get(6) | 128)); }
+inline bool late_game() { return (get(7) & 128) != 0; }
+inline void set_late_game() { put(7, static_cast<std::uint8_t>(get(7) | 128)); }
 
 } // namespace team_memory
