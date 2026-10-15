@@ -120,6 +120,7 @@ struct Mem {
     std::vector<std::uint32_t> unreachable_until; // per-group blacklist expiry
     std::vector<std::uint8_t> strikes;            // consecutive failed sorties per group
     int fled_group = -1;                          // camp the current pitstop fled; -1 = champion-driven
+    cambc::vec2 fled_pos{};                       // tile the pitstop broke on — loyalty anchor when no camp applies
     // Last live read on a group's remaining hp/dps — the heal-to-need
     // input; hp < 0 means never seen alive this match.
     struct CampLeft { float hp = -1.0f, dps = 0.0f; std::int32_t round = -1; };
@@ -137,7 +138,7 @@ struct Mem {
     int recall_attempts = 0;
     bool recall_pending = false; // recall issued, outcome not yet observed
     // Recall-gate chase read: last round's visible enemy positions — an
-    // attacker whose distance to our current tile fell is closing on us.
+    // attacker whose distance to our current tile fell is coming at us.
     struct EnemyMark { cambc::vec2 pos{}; };
     std::vector<EnemyMark> last_enemies;
     std::int32_t state_since = 0; // round the current FSM state began — stuck-state audit anchor
@@ -1213,8 +1214,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // destination. Off the tiles (ranged ring, mid-commute) the active
         // target stays the better guess.
         if (mem.state != State::pitstop)
+        {
+            mem.fled_pos = pos;
             mem.fled_group = (mem.state == State::travel || mem.state == State::clear)
                 && !threat ? (here >= 0 ? here : mem.active_target) : -1;
+        }
         // Sortie watchdog: contested exits only — an attrition bail is
         // paid-for progress (the pack keeps its wounds), while a bail
         // under enemy reach buys nothing. Pure-grind maps would otherwise
@@ -1266,11 +1270,11 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 exposed = true;
         // Recall breaks on any damage (GameRules §Channels), so it only
         // starts where nothing can hurt it for the whole channel. Inside
-        // ~5 tiles a single move puts almost any kit in range — never
-        // start. Too slow to arrive inside recall_time never breaks it.
-        // In between the veto goes to a body that is actually coming —
-        // its distance to *this* tile fell since last round (a gap delta
-        // to us hides the pursuit: we keep moving while kiting). A
+        // ~5 tiles one move puts almost any kit in range — never start.
+        // Too slow to arrive inside recall_time never breaks it. In
+        // between the veto goes to a body that is actually coming — its
+        // distance to *this* tile fell since last round (a gap delta to
+        // us hides the pursuit: we keep moving while kiting). A
         // bystander holding its ground is paid a free teleport home; a
         // fresh sighting reads as incoming.
         for (const auto& e : obs.enemies)
@@ -1283,7 +1287,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             const int range = info && info->attack_range > 0 ? info->attack_range : 3;
             if (gap > range + speed * cambc::constants::recall_time) continue;
             const Mem::EnemyMark* mark = nullptr;
-            float nearest = std::numeric_limits<float>::max();
+            std::int64_t nearest = std::numeric_limits<std::int64_t>::max();
             for (const auto& m : mem.last_enemies)
                 if (const auto d = m.pos.chebyshev_distance(e.position); d < nearest)
                 { nearest = d; mark = &m; }
@@ -1301,12 +1305,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             mem.recall_pending = true;
             return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
         }
-        // Escape leg: kite home, not beeline — step only onto tiles that
-        // open the gap on every visible enemy, preferring ones that don't
-        // lose spawnward progress. A raw spawn descent walks straight past
-        // the chaser or stalls walled into its reach, and a stalled leg
-        // reads as a yield inside chase range. apply() keeps the fight
-        // side: escape spells around the step, then a hit if one lands.
+        // Escape leg: kite in place, don't run home — measured ifish
+        // retreats orbit their own ground and keep fighting (camp
+        // loyalty ~0.64), they never commute to spawn. open = tiles
+        // that grow the gap on every visible enemy and sit outside
+        // hostile camp reach; loyal = ~7 tiles around the anchor — the
+        // camp we fled, else the assigned target, else the tile we
+        // broke on. apply() keeps the fight side: escape spells around
+        // the step, then a hit if one lands.
         cambc::bitboard open = ~blocked_tiles();
         for (const auto& e : obs.enemies)
         {
@@ -1315,22 +1321,25 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 static_cast<float>(pos.chebyshev_distance(e.position)));
             open &= ~close;
         }
-        const auto spawn = turn::spawn_region(cambc::team::ally);
-        cambc::bitboard goals = open;
-        if (!open.is_empty())
-        {
-            int home_dist = std::numeric_limits<int>::max();
-            cambc::vec2 anchor{};
-            for (const auto t : spawn.positions())
+        for (const auto& c : visible_camps())
+            if (c.health > 0 && c.strength > 0)
             {
-                const auto d = static_cast<int>(pos.chebyshev_distance(t));
-                if (d < home_dist) { home_dist = d; anchor = t; }
+                cambc::bitboard ring;
+                ring.draw_chebyshev(c.pos, static_cast<float>(c.attack_range));
+                open &= ~ring;
             }
-            cambc::bitboard homeward;
-            homeward.draw_chebyshev(anchor, static_cast<float>(home_dist));
-            if (const auto both = open & homeward; !both.is_empty()) goals = both;
-        }
-        if (goals.is_empty()) goals = spawn; // surrounded — push through
+        cambc::bitboard loyal;
+        const int anchor = mem.fled_group >= 0 ? mem.fled_group : mem.active_target;
+        if (anchor >= 0 && anchor < static_cast<int>(geos.size()))
+            for (const auto t : geos[static_cast<std::size_t>(anchor)].tile_list)
+                loyal.draw_chebyshev(t, 7.0f);
+        else
+            loyal.draw_chebyshev(mem.fled_pos, 7.0f);
+        cambc::bitboard goals = open & loyal;
+        if (goals.is_empty()) goals = open; // boxed in — take any safe step
+        if (goals.is_empty()
+            || (obs.enemies.empty() && mem.recall_attempts >= max_recall_retries))
+            goals = turn::spawn_region(cambc::team::ally); // nothing to kite — walk it off
         Move escape{ std::move(goals) };
         escape.escaping = true;
         return done(State::pitstop, escape, obs);
