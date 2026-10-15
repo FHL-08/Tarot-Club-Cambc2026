@@ -1,7 +1,10 @@
 team: mite
 chassis: foundry v14 (bots/foundry/src copy + clone_config.h)
-source: issue #84 replay study — ~3,300 decoded games; per-map draft comp,
-  attack-on-sight + ~3-turn chase, recall_hp 0.46, tribute cap 44,
-  measured itemisation order, ward placement on travel turns
-accuracy: policy_model.py ~0.808 (mite reference); skeleton fidelity = the
-  measured parameters, not a learned model
+source: issue #93 v2 action-level measured spec — per-map draft comp,
+  nearest-in-range targeting with deterministic champ-focus share,
+  per-team wait signature (mite heavy / ifish+shawn never /
+  hello respawn-wait), hello nav re-path on objective change,
+  ward team-budget, measured itemisation totals, recall_hp 0.5,
+  tribute cap 44
+accuracy: skeleton fidelity = the measured parameters, not a learned
+  model

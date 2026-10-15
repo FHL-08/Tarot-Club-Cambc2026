@@ -9,20 +9,37 @@
 
 namespace clone {
 
-// Attack-on-sight: an enemy inside the attack ring is always hit (lowest
-// hp% first). When it steps out, the same target is chased for up to this
-// many consecutive turns before the route resumes (measured ~3, p90 6).
+// Attack-on-sight: an enemy inside the attack ring is hit on the focus
+// cadence (nearest first). When it steps out, the same target is chased
+// for up to this many consecutive turns before the route resumes
+// (measured ~3, p90 6).
 inline constexpr int chase_cap = 3;
 // Flat hp trigger for the recall home — the threat lift is foundry's, not
 // measured policy.
-inline constexpr float recall_hp = 0.46f;
-// Wards ride the travel axis: one placement per body at most this many
-// times, paced by a minimum round gap — the replay metric is a team total
-// of ~21-28 per game, not a placement map, so pacing is approximate.
-inline constexpr std::uint8_t ward_per_body = 6;
+inline constexpr float recall_hp = 0.5f;
+// Ward budget: the measured team placements per game (issue #93); each
+// body rides its equal share, paced by the minimum round gap.
+inline constexpr std::uint8_t ward_per_body = 21;
 inline constexpr std::uint32_t ward_min_gap = 60;
 // Bank when the carried bag reaches this many gems.
 inline constexpr std::uint32_t trib_cap = 44;
+
+// Champion-focus share (issue #93): an enemy champion in the attack ring
+// takes the hit on every Nth in-range turn — measured ~1/N of attacks
+// land on champions. Targeting is nearest-in-range; lowest-hp% was a v1
+// misread (median attacked-target hp% ~0.5-0.6).
+inline constexpr int champ_focus_n = 7;
+// Wait signature (issue #93): never = always take an action, drifting to
+// the nearest objective when idle; respawn_wait = yield only while a camp
+// respawn sits within respawn_wait_rounds; heavy = yield most no-action
+// turns (every yield_mod'th reposition still moves).
+enum class YieldMode : std::uint8_t { never, respawn_wait, heavy };
+inline constexpr YieldMode yield_mode = YieldMode::respawn_wait;
+inline constexpr int yield_mod = 3;
+inline constexpr int respawn_wait_rounds = 8;
+// Nav orders (issue #93): true = re-path on any objective change (hello's
+// measured ~4x rate); false = re-path only when the target invalidates.
+inline constexpr bool nav_repath_on_change = true;
 
 // Draft comp per map, fingerprinted on (width, height, camp-group count) —
 // draft mode exposes no map name and the pool's fingerprints are unique.
@@ -73,12 +90,12 @@ inline constexpr MapComp draft_table[] = {
 struct EconItem { cambc::item_type item; std::uint32_t team_total; };
 
 inline constexpr EconItem econ_queue[] = {
-    { cambc::item_type::power_shard_of_focus, 8 },
-    { cambc::item_type::power_shard_of_strength, 6 },
-    { cambc::item_type::durability_shard_of_health, 16 },
-    { cambc::item_type::power_shard_of_health, 10 },
-    { cambc::item_type::jungle_shard_of_strength, 24 },
-    { cambc::item_type::bruiser_shard_of_health, 40 },
+    { cambc::item_type::power_shard_of_focus, 2 },
+    { cambc::item_type::power_shard_of_strength, 1 },
+    { cambc::item_type::durability_shard_of_health, 4 },
+    { cambc::item_type::power_shard_of_health, 2 },
+    { cambc::item_type::jungle_shard_of_strength, 6 },
+    { cambc::item_type::bruiser_shard_of_health, 10 },
 };
 
 } // namespace clone

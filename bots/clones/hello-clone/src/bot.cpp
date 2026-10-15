@@ -20,9 +20,17 @@ namespace {
 void clone_ward(const Obs& obs, const exec::Action& action, std::uint8_t& placed, std::uint32_t& last)
 {
     auto& me = turn::self();
+    // The budget is a team total — this body rides its equal share.
+    static const std::uint32_t share = [] {
+        std::size_t bodies = 4;
+        try { bodies = std::max<std::size_t>(1, cambc::champions(cambc::team::ally).size()); }
+        catch (const std::exception&) { }
+        return static_cast<std::uint32_t>(
+            (clone::ward_per_body + bodies - 1) / bodies);
+    }();
     try
     {
-        if (me.ward_cooldown() > 0 || placed >= clone::ward_per_body
+        if (me.ward_cooldown() > 0 || placed >= share
             || (last != 0 && obs.round < last + clone::ward_min_gap))
             return;
         const auto tiles = me.ward_placement_tiles();
