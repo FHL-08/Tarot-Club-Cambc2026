@@ -46,6 +46,12 @@ constexpr item_type str_only[]{
 // whittling a pack adjacent to its capture tiles.
 constexpr std::int64_t lock_pass_range = 3;
 
+// Per-visit bound and purse floor for the bulk scaling-shard spend below.
+// The reserve keeps both consumables buyable next visit (10g each,
+// GameRules §The shop).
+constexpr std::uint32_t bulk_reserve = 20;
+constexpr std::uint32_t bulk_cap = 4;
+
 std::span<const item_type> queue_for(cambc::champion_type champ)
 {
     using cambc::champion_type;
@@ -229,6 +235,23 @@ void econ::maybe_buy(Role role, const Obs& obs)
     // Standing orders once the first emblem is done — the pre-routes proxy
     // kept for unrouted bodies (docs/strategy.md §Champion-build queues).
     if (!routed && next >= 1) stock_consumables();
+
+    // A need-bounded buy strands the purse until the next shop visit —
+    // top-4 spend ~100+ items/game where we idle (issue #102). While the
+    // last entry builds, slack above the reserve buys extra copies of it:
+    // the tail is the scaling shard, and bought extras sit in inventory
+    // counting toward its next combine, so nothing is spent out of build
+    // order. An exhausted queue skips this — the uncapped tail below
+    // already drains the purse there.
+    if (next + 1 == queue.size())
+    {
+        const item_type tail = queue.back();
+        const std::uint32_t gold = me.gold_count();
+        const std::uint32_t budget = gold > bulk_reserve ? gold - bulk_reserve : 0;
+        const auto extra = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(bulk_cap, budget / tail.cost()));
+        if (extra && me.can_buy(tail, extra)) me.buy(tail, extra);
+    }
 
     if (next == queue.size())
     {
