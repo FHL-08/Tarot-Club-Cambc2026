@@ -1,0 +1,26 @@
+initialize:
+  - name: "Node 22 for the replay decoder (node:wasi)"
+    uses: github.com/actions/setup-node@v4
+    with:
+      node-version: "22"
+maintenance:
+  - name: "cambc engine, WASI toolchain, smoke match"
+    run: tools/setup.sh
+knowledge:
+  - name: build
+    contents: |
+      tools/setup.sh on a fresh machine (downloads the checksum-verified cambc.exe and the toolchain).
+      ./cambc.exe build <bot>   # bots/<name>/; production bot is foundry
+  - name: test
+    contents: |
+      Single match: ./cambc.exe run foundry starter-cpp --map expanse --statistics /tmp/s.json
+      Both-sides 9-map eval: tools/replay/local_eval.sh foundry <opponent>   (e.g. foundry-v14, ming-v12)
+      Read AGENTS.md first; factory rules and the verification bar live there.
+  - name: submit
+    contents: |
+      ./cambc.exe login once (interactive device sign-in by the user, lasts 7 days), then ./cambc.exe submit foundry.
+      Only submit a version that beats the current submission (latest snapshot bots/foundry-vN) locally from both sides.
+  - name: visualiser
+    contents: |
+      tools/viz.sh <replay|match-id|latest|last-platform [map]> serves http://127.0.0.1:7026/ on this VM.
+      The user views it through the session's browser, or forwards the port via `devin ssh`.
