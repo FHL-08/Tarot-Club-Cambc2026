@@ -1,0 +1,9 @@
+version: foundry-v16 (submission candidate)
+config: foundry with platform-v17 runtime mechanisms ported
+source: PR #98 / issue #97 — worth_waiting camp scheduling + remote-work
+  fallback, better_bank sticky altar banking, escape_spell_allowed +
+  follow_enemy_attack, observe_turn split, farm_damage gating,
+  warding empty-bag gate
+evidence: local_eval vs clones/platform-v17 12-6 (won 6-3 as A, 6-3 as B —
+  baseline was 7-11); local_eval vs foundry-v15 10-8 (baseline 7-11);
+  gemsLostOnDeath ~halved; botFaults 0
