@@ -669,10 +669,11 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
     if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
     const auto& abilities = turn::abilities();
     auto first_hit = [&](std::uint8_t slot, const cambc::bitboard& tiles,
-                         bool ground) -> std::optional<exec::Cast>
+                         bool ground, float radius = 0) -> std::optional<exec::Cast>
     {
         for (const auto& c : visible_camps())
-            if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos))
+            if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos)
+                && (!ground || radius <= 0 || cast_area_safe(g, c.pos, radius)))
             {
                 mem.last_cast_slot = slot;
                 mem.last_cast_round = round;
@@ -806,7 +807,13 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
             const bool ground = turn::slot_targets(slot).contains(cambc::ability_target_mask::ground);
             if (!turn::slot_targets(slot).contains(cambc::ability_target_mask::camps) && !ground)
                 continue;
-            if (const auto cast = first_hit(slot, turn::slot_reach(slot), ground)) return cast;
+            // The fallback's ground blast lands on the member's own tile;
+            // keep the same foreign-group guard or the rescue can wake the
+            // pack the scorer just refused to touch.
+            float fb_radius = 0;
+            if (ab.is_aoe_damage()) fb_radius = ab.get<cambc::ability_aoe_damage>().radius;
+            else if (ab.is_cc() && turn::self().champion_name() == cambc::champion_type::ryth) fb_radius = 1;
+            if (const auto cast = first_hit(slot, turn::slot_reach(slot), ground, fb_radius)) return cast;
         }
     return std::nullopt;
 }
