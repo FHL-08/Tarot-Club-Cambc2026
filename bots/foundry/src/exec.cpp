@@ -68,6 +68,45 @@ constexpr std::int64_t opportunity_range = 6;
 // stale_reward).
 constexpr std::int32_t stale_rounds = 24;
 
+// Pure decision rules ported verbatim from platform-v17's runtime_policy.h
+// (issue #97) — identical inputs must produce identical choices. winning_bag
+// lives in econ, should_retreat is the retreat_floor/threat-lift pair above,
+// stale_reward is the stale_rounds reinspection below.
+namespace runtime_policy {
+
+// Retreat spends movement before considering a walking-exclusive spell.
+// If the escape attempt fails, that unused turn can still defend the carrier;
+// a compatible spell never needs to trade away the planned escape step.
+constexpr bool escape_spell_allowed(bool excludes_walking, bool escape_failed) {
+    return !excludes_walking || escape_failed;
+}
+
+// A respawn wait is justified only while a future timer is near. An overdue
+// belief requires inspection or reassignment, not another indefinite Wait.
+constexpr bool worth_waiting(std::int32_t ready, std::uint32_t round, int travel) {
+    return ready > static_cast<std::int32_t>(round)
+        && ready - static_cast<std::int32_t>(round) <= travel + 12;
+}
+
+// Rank reachable altars: open routes beat known hostile locks; actual path
+// length beats geometric closeness. A planned altar only breaks equal ties.
+constexpr bool better_bank(bool hostile, unsigned distance, bool preferred,
+                           bool best_hostile, unsigned best_distance, bool best_preferred) {
+    if (hostile != best_hostile) return !hostile;
+    if (distance != best_distance) return distance < best_distance;
+    return preferred && !best_preferred;
+}
+
+// A hostile altar lock takes three basic attacks to remove. For a carrier
+// already heading there, walking to an open altar is worth the diversion only
+// when its extra path length costs fewer turns than clearing that lock.
+constexpr bool open_altar_saves_time(unsigned locked_distance, unsigned open_distance) {
+    return open_distance < locked_distance
+        || static_cast<std::uint64_t>(open_distance) - locked_distance < 3;
+}
+
+} // namespace runtime_policy
+
 // Per-champion memory: the decision is re-derived each turn; these only
 // power the transition log plus the contested/capture windows.
 struct Mem {
@@ -111,6 +150,12 @@ struct Mem {
     int sector_start = -1;                 // round the home sector took effect (-1 = opening still running)
     int sector_id = -1;                    // this body's wedge index
     bool sector_on = false;                // sector_start set and within its 150-round window
+    int bank_target = -1;                  // sticky altar pick between re-evals (v17 better_bank)
+    std::vector<std::uint32_t> bank_blocked_until; // per-altar approach-ring cooldown
+    // A pure stun is not lasting progress between healing trips: set when a
+    // landed camp attack/cast dealt real damage this sortie; the contested
+    // bail watchdog reads and clears it.
+    bool farm_damage = false;
 };
 Mem mem;
 
@@ -213,6 +258,10 @@ const std::vector<int>& group_wedge();
 
 bool mine(int g)
 {
+    // The territorial assignment (v17 camp_jobs): a champ's job is a
+    // permanent set — the compiled route's stops plus the modulo
+    // partition's leftovers — and it never expires. The remote fallback in
+    // tick is what camps outside the territory are for.
     const int stride = std::max(1, std::min(mem.allies, static_cast<int>(groups().size())));
     if (g >= 0 && g % stride == mem.slot % stride) return true;
     if (mem.have_route)
@@ -686,7 +735,7 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
             {
                 mem.last_cast_slot = slot;
                 mem.last_cast_round = round;
-                return exec::Cast{ slot, c.pos, ground };
+                return exec::Cast{ slot, c.pos, ground, g };
             }
         return std::nullopt;
     };
@@ -738,7 +787,7 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
             {
                 mem.last_cast_slot = slot;
                 mem.last_cast_round = round;
-                return exec::Cast{ slot, slot_tile, false };
+                return exec::Cast{ slot, slot_tile, false, g };
             }
             continue;
         }
@@ -801,7 +850,7 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
         {
             mem.last_cast_slot = slot;
             mem.last_cast_round = round;
-            return exec::Cast{ slot, slot_tile, true };
+            return exec::Cast{ slot, slot_tile, true, g };
         }
     }
     // The scorer may exhaust its reserve mid-scan or find only
@@ -827,6 +876,86 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
     return std::nullopt;
 }
 
+// Protect an escape without chasing (v17 protect_escape). Before movement,
+// only walking-compatible spells are allowed; if navigation fails, a
+// stationary spell can use the otherwise lost turn against an immediate
+// threat.
+bool protect_escape(bool escape_failed = false)
+{
+    const auto& me = turn::self();
+    if (!me.can_cast() || cambc::fuel_remaining() < 24000) return false;
+    const auto& abilities = turn::abilities();
+    for (std::uint32_t slot = 0; slot < 2; ++slot)
+    {
+        const auto& ab = abilities[slot];
+        if (!turn::slot_ready(slot) || !ab.info()) continue;
+        const bool exclusive = std::visit(
+            [](const auto& payload) { return payload.exclusive_with_movement; }, *ab.info());
+        if (!runtime_policy::escape_spell_allowed(exclusive, escape_failed))
+            continue;
+        try {
+            const auto targets = ab.valid_targets();
+            if ((ab.is_shield() || ab.is_heal())
+                && targets.contains(cambc::ability_target_mask::self))
+            {
+                if (ab.use()) { turn::note_moved(); return true; }
+            }
+            if (!ab.is_cc() && !ab.is_damage() && !ab.is_aoe_damage()) continue;
+            const auto reach = turn::slot_reach(slot);
+            for (const auto& enemy : visible_enemies())
+            {
+                // Defense is optional work: leave fuel for navigation and
+                // the normal turn epilogue instead of scanning to zero.
+                if (cambc::fuel_remaining() < 24000) return false;
+                if (!enemy.is_visible() || enemy.health() <= 0) continue;
+                const auto p = enemy.position();
+                if (!reach.is_set(p)) continue;
+                const auto enemy_range = turn::enemy_attack_range(p);
+                // Only retaliate against a visible champion able to
+                // threaten us after one ordinary step — never a chase job.
+                if (!enemy_range || me.position().chebyshev_distance(p) > *enemy_range + 1) continue;
+                const bool used = targets.contains(cambc::ability_target_mask::enemies)
+                    ? ab.use(enemy)
+                    : targets.contains(cambc::ability_target_mask::ground) && ab.use(p);
+                turn::note_moved(); // a rejected ground cast may reveal a blocker too
+                if (used) return true;
+            }
+        } catch (const cambc::error&) { }
+    }
+    return false;
+}
+
+// Spend a legal basic hit on a visible nearby attacker, without chasing it
+// (v17 follow_enemy_attack). Copy a tile before invalidating caches:
+// references into visible_enemies() must not survive a fresh query.
+bool follow_enemy_attack()
+{
+    const auto& me = turn::self();
+    if (cambc::fuel_remaining() < 18000 || !me.can_attack()) return false;
+    const auto tiles = turn::attack_tiles();
+    std::optional<cambc::vec2> target;
+    float lowest_hp = std::numeric_limits<float>::max();
+    for (const auto& enemy : visible_enemies())
+        try {
+            if (!enemy.is_visible()) continue;
+            const float hp = enemy.health();
+            const auto p = enemy.position();
+            if (hp > 0 && hp < lowest_hp && tiles.is_set(p))
+            { lowest_hp = hp; target = p; }
+        } catch (const cambc::error&) { /* a stale enemy is not a valid hit */ }
+    if (!target) return false;
+    try {
+        if (const auto* enemy = turn::enemy_at(*target);
+            enemy && enemy->is_visible() && enemy->health() > 0)
+        {
+            me.attack(*enemy);
+            turn::note_moved();
+            return true;
+        }
+    } catch (const cambc::error&) { }
+    return false;
+}
+
 exec::Action done(State next, const exec::Action& action, const Obs& obs)
 {
     if (next != mem.state)
@@ -838,6 +967,77 @@ exec::Action done(State next, const exec::Action& action, const Obs& obs)
 }
 
 } // namespace
+
+// Observe alive/dead transitions and own cast outcomes without issuing an
+// action (v17 observe_turn). play_turn calls this ahead of the is_alive
+// gate so dead and channelling bodies still learn the same facts; dead
+// shopping and normal turn priorities remain in Bot::play_turn.
+void exec::observe_turn(const Obs& obs)
+{
+    try {
+    const auto& geos = groups();
+    if (mem.strikes.size() != geos.size()) mem.strikes.assign(geos.size(), 0);
+    if (mem.camp_seen.size() != geos.size()) mem.camp_seen.assign(geos.size(), -1);
+    if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
+    // The sighting refresh must run on every kind of turn: a channel, dead
+    // or fizzle turn still observed camps, and skipping it leaves
+    // ledger::never entries out of reinspection indefinitely.
+    for (const auto& c : obs.camps)
+    {
+        if (c.group < mem.camp_seen.size())
+            mem.camp_seen[c.group] = static_cast<std::int32_t>(obs.round);
+        if (c.group < mem.strikes.size()
+            && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
+                || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
+            mem.strikes[c.group] = 0;
+    }
+    // Snapshot live member hp/dps sums — rebuilt each round from the
+    // members currently in vision, so an edge-of-vision sighting
+    // overwrites a fuller read with the subset sum and heal_target
+    // under-prices the real pack (a known under-estimate, tolerated: the
+    // miss only releases a sortie early). Camps don't regen, so a full
+    // read stays exact until someone else touches the pack.
+    for (const auto& c : visible_camps())
+    {
+        const int g = group_of(c.spawn);
+        if (g < 0) continue;
+        auto& left = mem.camp_left[static_cast<std::size_t>(g)];
+        if (left.round != static_cast<std::int32_t>(obs.round))
+        {
+            left.hp = 0;
+            left.dps = 0;
+            left.round = static_cast<std::int32_t>(obs.round);
+        }
+        if (c.health > 0)
+        {
+            left.hp += c.health;
+            left.dps += c.strength;
+        }
+    }
+    // Cast-fizzle verify: a successful cast spends the 8-turn cooldown, so
+    // a slot still ready the very next round fizzled (thrown at apply).
+    // Three in a row retires the slot — without this a fizzling cast is
+    // re-emitted every turn forever.
+    if (mem.last_cast_slot >= 0 && obs.round > mem.last_cast_round)
+    {
+        try
+        {
+            const auto s = static_cast<std::size_t>(mem.last_cast_slot);
+            if (obs.round == mem.last_cast_round + 1)
+            {
+                if (turn::slot_ready(static_cast<std::uint32_t>(s)))
+                {
+                    if (++mem.cast_strikes[s] >= 3) mem.cast_banned[s] = true;
+                }
+                else
+                    mem.cast_strikes[s] = 0;
+            }
+        }
+        catch (const cambc::error&) { }
+        mem.last_cast_slot = -1;
+    }
+    } catch (const std::exception&) { }
+}
 
 exec::Action exec::tick(const Obs& obs, const Plan& plan)
 {
@@ -886,52 +1086,10 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
 
     bind_plan(plan);
 
-    // Stale-reward bookkeeping must precede every early return: a channel,
-    // fizzle-verify or tactic turn still observed camps, and skipping the
-    // sighting here leaves ledger::never entries out of reinspection
-    // indefinitely.
-    {
-        const auto& geos0 = groups();
-        if (mem.strikes.size() != geos0.size()) mem.strikes.assign(geos0.size(), 0);
-        if (mem.camp_seen.size() != geos0.size()) mem.camp_seen.assign(geos0.size(), -1);
-        for (const auto& c : obs.camps)
-        {
-            if (c.group < mem.camp_seen.size())
-                mem.camp_seen[c.group] = static_cast<std::int32_t>(obs.round);
-            if (c.group < mem.strikes.size()
-                && (std::holds_alternative<cambc::map::camp_group_respawning>(c.state)
-                    || std::holds_alternative<cambc::map::camp_group_reward_available>(c.state)))
-                mem.strikes[c.group] = 0;
-        }
-    }
-
     // Mid-channel turns can't act — tribute/recall/teleport continue alone.
     if (st.contains(cs::submitting_gems) || st.contains(cs::recalling) || st.contains(cs::teleporting)
         || (!st.contains(cs::can_move) && !st.contains(cs::can_attack)))
         return done(State::channel, Wait{}, obs);
-
-    // Cast-fizzle verify: a successful cast spends the 8-turn cooldown, so
-    // a slot still ready the very next round fizzled (thrown at apply).
-    // Three in a row retires the slot — without this a fizzling cast is
-    // re-emitted every turn forever.
-    if (mem.last_cast_slot >= 0 && obs.round > mem.last_cast_round)
-    {
-        try
-        {
-            const auto s = static_cast<std::size_t>(mem.last_cast_slot);
-            if (obs.round == mem.last_cast_round + 1)
-            {
-                if (turn::slot_ready(static_cast<std::uint32_t>(s)))
-                {
-                    if (++mem.cast_strikes[s] >= 3) mem.cast_banned[s] = true;
-                }
-                else
-                    mem.cast_strikes[s] = 0;
-            }
-        }
-        catch (const cambc::error&) { }
-        mem.last_cast_slot = -1;
-    }
 
     // Tactic modules make their own live reads (buffs, consumables, a
     // recaller query per enemy) — a stale read there must not fault the
@@ -955,31 +1113,6 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const cambc::vec2 pos = obs.self_pos;
     const int here = group_of(pos);
     const bool at_spawn = turn::spawn_region(cambc::team::ally).is_set(pos);
-
-    if (mem.camp_left.size() != geos.size()) mem.camp_left.assign(geos.size(), {});
-    // Snapshot live member hp/dps sums — rebuilt each round from the
-    // members currently in vision, so an edge-of-vision sighting
-    // overwrites a fuller read with the subset sum and heal_target
-    // under-prices the real pack (a known under-estimate, tolerated: the
-    // miss only releases a sortie early). Camps don't regen, so a full
-    // read stays exact until someone else touches the pack.
-    for (const auto& c : visible_camps())
-    {
-        const int g = group_of(c.spawn);
-        if (g < 0) continue;
-        auto& left = mem.camp_left[static_cast<std::size_t>(g)];
-        if (left.round != static_cast<std::int32_t>(obs.round))
-        {
-            left.hp = 0;
-            left.dps = 0;
-            left.round = static_cast<std::int32_t>(obs.round);
-        }
-        if (c.health > 0)
-        {
-            left.hp += c.health;
-            left.dps += c.strength;
-        }
-    }
 
     // Lethal-threat proxy: a visible enemy champion inside maximum attack
     // reach (3). Enemy camps aren't observable here, so plain low-HP stays
@@ -1082,7 +1215,9 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         // paid-for progress (the pack keeps its wounds), while a bail
         // under enemy reach buys nothing. Pure-grind maps would otherwise
         // blacklist their only work. A camp that died mid-sortie (reward
-        // or respawn already visible) is a success either way.
+        // or respawn already visible) is a success either way, and so is a
+        // sortie that landed real camp damage — a pure stun is not lasting
+        // progress between healing trips (v17 farm_damage).
         if ((mem.state == State::travel || mem.state == State::clear)
             && mem.active_target >= 0 && threat)
         {
@@ -1090,7 +1225,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             const bool died = c
                 && (std::holds_alternative<cambc::map::camp_group_respawning>(c->state)
                     || std::holds_alternative<cambc::map::camp_group_reward_available>(c->state));
-            if (!died)
+            if (!died && !mem.farm_damage)
             {
                 const auto g = static_cast<std::size_t>(mem.active_target);
                 if (++mem.strikes[g] >= strike_limit)
@@ -1102,6 +1237,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
                 }
             }
         }
+        mem.farm_damage = false; // consumed — the next sortie starts a fresh ledger
         if (at_spawn) return done(State::pitstop, Wait{}, obs); // turn end heals to full
         bool exposed = threat;
         for (const auto& c : visible_camps())
@@ -1118,7 +1254,12 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
             mem.recall_pending = true;
             return done(State::pitstop, Channel{ Channel::Kind::recall }, obs);
         }
-        return done(State::pitstop, Move{ turn::spawn_region(cambc::team::ally) }, obs);
+        // Escape leg (v17 protect_escape): apply() may spend a defensive
+        // spell around the step — before it only walking-compatible ones,
+        // and a failed step frees the stationary kit for the lost turn.
+        Move escape{ turn::spawn_region(cambc::team::ally) };
+        escape.escaping = true;
+        return done(State::pitstop, escape, obs);
     }
 
     const auto blocked = blocked_tiles();
@@ -1142,44 +1283,97 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
     const bool bank_now = over_cap || econ::should_tribute(obs);
     if (bank_now)
     {
-        cambc::vec2 nearest{}, locked{};
-        std::int64_t nearest_d = std::numeric_limits<std::int64_t>::max();
-        std::int64_t locked_d = std::numeric_limits<std::int64_t>::max();
-        cambc::bitboard rings;
         const auto& altars = turn::altars();
-        // A locked route altar falls back to the nearest unlocked one.
-        if (preferred >= 0 && turn::altar_locked(altars[preferred])) preferred = -1;
-        for (std::size_t a = 0; a < altars.size(); ++a)
+        if (mem.bank_blocked_until.size() != altars.size())
+            mem.bank_blocked_until.assign(altars.size(), 0);
+        // Legal submit tiles around an altar (v17 better_bank): altars
+        // themselves are impassable, so the masked ring is the approach set.
+        const auto approach = [&](std::size_t i) {
+            cambc::bitboard ring;
+            ring.draw_chebyshev(altars[i], cambc::constants::submit_gems_range);
+            ring &= ~blocked;
+            return ring;
+        };
+        // Keep a reachable banking destination while it stays useful. A
+        // lock can land after the pick, so recheck live lock state before
+        // spending more gem-carrying turns walking toward it.
+        const int previous = mem.bank_target;
+        bool previous_approach = previous >= 0 && previous < static_cast<int>(altars.size());
+        if (previous_approach && approach(static_cast<std::size_t>(previous)).is_empty())
         {
-            const auto altar = altars[a];
-            // The route's spliced ALTAR stop is the planned tribute point:
-            // while it stands unlocked, other altars don't compete.
-            if (preferred >= 0 && static_cast<std::int32_t>(a) != preferred) continue;
-            // An enemy lock turns the tribute attempt into a lock attack
-            // (GameRules §Tributing against a lock) — taking the nearest
-            // locked altar still clears it, while our own locks never block
-            // us and unlocked altars always win the pick.
-            const bool enemy_locked = turn::altar_locked(altar)
-                && turn::altar_lock_is_enemy(altar);
-            rings.draw_chebyshev(altar, cambc::constants::submit_gems_range);
-            if (const auto d = pos.chebyshev_distance(altar); !enemy_locked && d < nearest_d)
+            // An occupied ring may reopen next turn; do not spin on it
+            // while another altar has a legal tile for this bag.
+            mem.bank_blocked_until[static_cast<std::size_t>(previous)] = obs.round + 12;
+            previous_approach = false;
+            mem.bank_target = -1;
+        }
+        if (!previous_approach) mem.bank_target = -1;
+        const bool hostile_target = mem.bank_target >= 0
+            && turn::altar_locked(altars[static_cast<std::size_t>(mem.bank_target)])
+            && turn::altar_lock_is_enemy(altars[static_cast<std::size_t>(mem.bank_target)]);
+        const bool cooling_target = mem.bank_target >= 0
+            && mem.bank_blocked_until[static_cast<std::size_t>(mem.bank_target)] > obs.round;
+        // A low-fuel turn keeps a still-reachable target rather than buying
+        // the ~30k distance field; with no target it banks later instead of
+        // starving the rest of the turn.
+        if ((mem.bank_target < 0 || hostile_target || cooling_target)
+            && cambc::fuel_remaining() >= 25000)
+        {
+            cambc::bitboard origin, visited;
+            origin.set(pos);
+            cambc::distance_field field;
+            field.compute(blocked, origin, visited);
+            int candidate = -1;
+            bool best_hostile = true;
+            unsigned best_distance = cambc::distance_field::unreachable;
+            unsigned previous_distance = cambc::distance_field::unreachable;
+            for (std::size_t i = 0; i < altars.size(); ++i)
             {
-                nearest_d = d;
-                nearest = altar;
+                unsigned distance = cambc::distance_field::unreachable;
+                for (const auto tile : approach(i).positions())
+                    distance = std::min(distance, static_cast<unsigned>(field.get(tile)));
+                if (static_cast<int>(i) == previous) previous_distance = distance;
+                if (distance == cambc::distance_field::unreachable) continue;
+                if (mem.bank_blocked_until[i] > obs.round) continue;
+                // An enemy lock turns the tribute attempt into a lock
+                // attack (GameRules §Tributing against a lock) — still
+                // reachable, but an open route always outranks it.
+                const bool hostile = turn::altar_locked(altars[i])
+                    && turn::altar_lock_is_enemy(altars[i]);
+                if (candidate < 0 || runtime_policy::better_bank(hostile, distance,
+                        static_cast<int>(i) == preferred, best_hostile, best_distance,
+                        candidate == preferred))
+                {
+                    candidate = static_cast<int>(i);
+                    best_hostile = hostile;
+                    best_distance = distance;
+                }
             }
-            else if (enemy_locked && d < locked_d)
+            if (mem.bank_target < 0)
             {
-                locked_d = d;
-                locked = altar;
+                // The watchdog may have cooled the only reachable altar.
+                // Retry it instead of waiting forever with gems in the bag.
+                mem.bank_target = candidate >= 0 ? candidate
+                    : (previous_approach && previous_distance != cambc::distance_field::unreachable
+                        ? previous : -1);
+            }
+            else if (candidate >= 0 && candidate != mem.bank_target
+                && ((hostile_target && !best_hostile
+                        && runtime_policy::open_altar_saves_time(previous_distance, best_distance))
+                    || (cooling_target && hostile_target == best_hostile)))
+            {
+                // A nearby open altar saves the three lock-clearing
+                // attacks. A distant one does not: keep the shorter route.
+                mem.bank_target = candidate;
             }
         }
-        if (nearest_d <= cambc::constants::submit_gems_range)
-            return done(State::bank, Channel{ Channel::Kind::tribute, nearest }, obs);
-        if (locked_d <= cambc::constants::submit_gems_range)
-            return done(State::bank, Channel{ Channel::Kind::tribute, locked }, obs);
-        rings &= ~blocked;
-        if (!rings.is_empty()) // every approach tile occupied: bank later
-            return done(State::bank, Move{ std::move(rings) }, obs);
+        if (mem.bank_target >= 0)
+        {
+            const auto altar = altars[static_cast<std::size_t>(mem.bank_target)];
+            if (pos.chebyshev_distance(altar) <= cambc::constants::submit_gems_range)
+                return done(State::bank, Channel{ Channel::Kind::tribute, altar }, obs);
+            return done(State::bank, Move{ approach(static_cast<std::size_t>(mem.bank_target)) }, obs);
+        }
     }
 
     // Route step. With a compiled route: cyclic scan from the cursor — the
@@ -1263,7 +1457,7 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         }
     };
 
-    const auto scan = [&](bool relaxed) {
+    const auto scan = [&](bool relaxed, bool remote = false) {
         if (mem.have_route)
         {
             // Cyclic scan from the cursor — strict cycle order would force
@@ -1288,7 +1482,14 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         std::vector<cambc::vec2> readable_allies;
         bool allies_loaded = false;
         const auto open_nearby = [&](std::size_t g) {
-            if (!geos[g].gems || dist_to(geos[g], pos) > opportunity_range) return false;
+            if (!geos[g].gems || (!remote && dist_to(geos[g], pos) > opportunity_range)) return false;
+            // A nearby ally may be idle, not clearing this pack. Only during
+            // the remote fallback is a personally observed LIVE pack still
+            // useful work; unseen camps and rewards keep the ally check.
+            if (remote)
+                if (const CampObs* c = seen(obs, static_cast<int>(g));
+                    c && std::holds_alternative<cambc::map::camp_group_alive>(c->state))
+                    return true;
             if (!allies_loaded)
             {
                 allies_loaded = true;
@@ -1418,6 +1619,39 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         desperate = fit_gem_supply == 0;
         if (desperate) { scanned = 0; scan(true); }
 
+        // Remote work (v17 camp_jobs): assigned gem work exhausted — compare
+        // safe foreign gem work before parking or farming gold. Territory
+        // still wins the first pass; reward capture ownership is preserved;
+        // a nearby idle ally does not exclude personally observed live work
+        // in this pass.
+        if (target < 0)
+        {
+            scanned = 0;
+            scan(false, true);
+            if (target >= 0)
+            {
+                // A nearby respawn due shortly can beat a cross-map errand:
+                // travel/wait plus clear time against the remote commute
+                // (cheap timing estimate, not a hidden-state camp query).
+                const float remote_time = static_cast<float>(dist_to(geos[target], pos))
+                    + geos[target].health / my_dps();
+                for (std::size_t g = 0; g < geos.size(); ++g)
+                {
+                    if (!mine(static_cast<int>(g)) || !geos[g].gems || geos[g].monolith
+                        || unfit(geos[g], obs.self_max_health)
+                        || unreachable(static_cast<int>(g), obs.round))
+                        continue;
+                    const auto ready = ledger::ready_round(static_cast<int>(g));
+                    const int travel = static_cast<int>(dist_to(geos[g], pos));
+                    if (!runtime_policy::worth_waiting(ready, obs.round, travel)) continue;
+                    const float local_time = static_cast<float>(std::max(
+                            travel, ready - static_cast<std::int32_t>(obs.round)))
+                        + geos[g].health / my_dps();
+                    if (local_time < remote_time) { target = -1; break; }
+                }
+            }
+        }
+
         if (target < 0) { target = gold_target; target_reward = gold_reward; }
         // An in-flight gold errand is preemptible the moment real work exists.
         if (active_state && mem.active_target >= 0 && geos[mem.active_target].gems == 0 && target >= 0)
@@ -1498,6 +1732,13 @@ exec::Action exec::tick(const Obs& obs, const Plan& plan)
         if (unfit(geos[g], obs.self_max_health) && !desperate && !overdue)
             continue;
         const auto d = dist_to(geos[g], pos);
+        // v17 worth_waiting: a respawn wait is justified only while its
+        // timer is near — a far-future respawn loses to the remote work
+        // above, and an overdue (never-scheduled) belief merits the
+        // inspection walk, not an indefinite ring-wait.
+        if (ready != ledger::never
+            && !runtime_policy::worth_waiting(ready, obs.round, static_cast<int>(d)))
+            continue;
         const std::int32_t eff = ready == ledger::never
             ? static_cast<std::int32_t>(obs.round) : ready;
         if (haul < 0 || eff < haul_ready || (eff == haul_ready && d < haul_dist))
@@ -1566,7 +1807,33 @@ bool exec::apply(const Action& action)
             using T = std::decay_t<decltype(a)>;
             if constexpr (std::is_same_v<T, Move>)
             {
+                bool protected_walk = false;
+                // Optional defense must never prevent the required escape
+                // walk when a target or ability read becomes unavailable.
+                if (a.escaping) try { protected_walk = protect_escape(); }
+                catch (const std::exception&) { }
                 const bool moved = nav::step(a.goals);
+                if (a.escaping)
+                {
+                    bool defended = false;
+                    if (!moved)
+                        try {
+                            // Failed movement can reveal blockers. Refresh
+                            // before a stationary spell, and never let it
+                            // replace a step that could have succeeded.
+                            turn::note_moved();
+                            defended = protect_escape(true);
+                        } catch (const std::exception&) { }
+                    bool attacked = false;
+                    try {
+                        // Melee can hit after walking; ranged normally
+                        // cannot — the live allowance decides. If walking
+                        // failed an in-range hit is also useful. Never
+                        // chase or hit a camp.
+                        attacked = follow_enemy_attack();
+                    } catch (const std::exception&) { }
+                    return moved || protected_walk || defended || attacked;
+                }
                 // A route/haul Move that can't descend at all means the
                 // goal is unreachable from here — nav_fail_limit turns in
                 // a row blacklists the group for nav_cooldown rounds so the
@@ -1620,7 +1887,7 @@ bool exec::apply(const Action& action)
                         {
                             if (c.health <= 0 || !attack_tiles.is_set(c.pos)) continue;
                             if (group_of(c.spawn) != mem.nav_pending) continue;
-                            try { me.attack(c.handle); return true; }
+                            try { me.attack(c.handle); mem.farm_damage = true; return true; }
                             catch (const cambc::error&) { return moved; }
                         }
                     }
@@ -1635,7 +1902,8 @@ bool exec::apply(const Action& action)
                     try
                     {
                         const auto camp = cambc::vision::camp_at(a.target);
-                        if (camp.is_visible() && camp.health() > 0) { me.attack(camp); return true; }
+                        if (camp.is_visible() && camp.health() > 0)
+                        { me.attack(camp); mem.farm_damage = true; return true; }
                     }
                     catch (const cambc::error&) { /* stale target: fall through to champion */ }
                 }
@@ -1650,7 +1918,8 @@ bool exec::apply(const Action& action)
                     try
                     {
                         const auto camp = cambc::vision::camp_at(a.target);
-                        if (camp.is_visible() && camp.health() > 0) { me.attack(camp); return true; }
+                        if (camp.is_visible() && camp.health() > 0)
+                        { me.attack(camp); mem.farm_damage = true; return true; }
                     }
                     catch (const cambc::error&) { }
                 }
@@ -1664,7 +1933,12 @@ bool exec::apply(const Action& action)
                 {
                     // A stale or out-of-range ground tile throws; treat it
                     // like any other fizzled action, not a faulted turn.
-                    try { return abilities[a.slot].use(a.target); }
+                    try
+                    {
+                        if (abilities[a.slot].use(a.target))
+                        { if (a.farm_group >= 0) mem.farm_damage = true; return true; }
+                        return false;
+                    }
                     catch (const cambc::error&) { return false; }
                 }
                 try
@@ -1675,10 +1949,16 @@ bool exec::apply(const Action& action)
                             "tile emptied between tick and apply" };
                     if (!abilities[a.slot].use(*enemy))
                         return false;
+                    if (a.farm_group >= 0) mem.farm_damage = true;
                 }
                 catch (const cambc::error&)
                 {
-                    try { return abilities[a.slot].use(cambc::vision::camp_at(a.target)); }
+                    try
+                    {
+                        if (abilities[a.slot].use(cambc::vision::camp_at(a.target)))
+                        { if (a.farm_group >= 0) mem.farm_damage = true; return true; }
+                        return false;
+                    }
                     catch (const cambc::error&) { return false; }
                 }
                 // An attack-reset cast restores the attack allowance it
