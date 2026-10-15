@@ -99,8 +99,11 @@ std::uint32_t walk_to_altar(cambc::vec2 from)
 
 // Small bags early: <=10 gems is a 1-tick, damage-proof channel
 // (docs/GameRules.md — only stun/death/altar-lock interrupt tribute).
-// The cap grows with the round, tightens when behind on the scoreboard,
-// and stays under the audit ceiling no matter what.
+// The cap grows with the round and tightens when behind on the
+// scoreboard; its ceiling stops at 25 (issue #108): every gem past ~10
+// rides through one more interruptible tick, and the kills the merged
+// fight shape invites turn a 40-gem bag into a double swing — the drop
+// plus the killer's own banking trip.
 std::uint32_t bag_cap(const Obs& obs)
 {
     std::int64_t cap = 10 + static_cast<std::int64_t>(obs.round) / 60;
@@ -108,7 +111,7 @@ std::uint32_t bag_cap(const Obs& obs)
     const auto theirs = turn::submitted_gems(cambc::team::enemy);
     if (theirs > ours)
         cap -= std::min<std::int64_t>(10, static_cast<std::int64_t>(theirs - ours) / 25);
-    return static_cast<std::uint32_t>(std::clamp<std::int64_t>(cap, 10, 40));
+    return static_cast<std::uint32_t>(std::clamp<std::int64_t>(cap, 10, 25));
 }
 
 // Chebyshev to the nearest tile of a team's spawn region — the same
@@ -243,7 +246,12 @@ void econ::maybe_buy(Role role, const Obs& obs)
     // counting toward its next combine, so nothing is spent out of build
     // order. An exhausted queue skips this — the uncapped tail below
     // already drains the purse there.
-    if (next + 1 == queue.size())
+    // The spend is skipped by carriers (issue #108): a live body holding
+    // a non-trivial bag keeps its purse whole — the gems already in hand
+    // outrank stacking more shard value onto a death-risk trip, and the
+    // spend can still land on the next visit once the bag is banked.
+    const bool exit_bound = obs.self_alive && obs.self_gems >= 10;
+    if (!exit_bound && next + 1 == queue.size())
     {
         const item_type tail = queue.back();
         const std::uint32_t gold = me.gold_count();
@@ -256,8 +264,13 @@ void econ::maybe_buy(Role role, const Obs& obs)
     if (next == queue.size())
     {
         // Tail: the queue's last shard repeats open-ended (stats stack).
+        // Same purse floor as the building-phase spend — a drained purse
+        // is what leaves a spent tp_crystal unrestocked for the exit leg
+        // (issue #108).
         const item_type tail = queue.back();
-        const auto count = static_cast<std::uint32_t>(me.gold_count() / tail.cost());
+        const std::uint32_t gold = me.gold_count();
+        const std::uint32_t budget = gold > bulk_reserve ? gold - bulk_reserve : 0;
+        const auto count = static_cast<std::uint32_t>(budget / tail.cost());
         if (count && me.can_buy(tail, count)) me.buy(tail, count);
     }
 }
