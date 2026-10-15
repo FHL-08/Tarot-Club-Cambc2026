@@ -23,4 +23,9 @@ void maybe_buy(Role role, const Obs& obs);
 // bag cap, or when remaining rounds no longer fit channel + walk time.
 bool should_tribute(const Obs& obs);
 
+// True only for the instant-win tribute: banked + carried reaching
+// winning_gems. Must preempt tactical offers — a winning carrier that
+// pokes instead hands the enemy a reprieve (and the bag on a death).
+bool winning_bag(const Obs& obs);
+
 } // namespace econ
