@@ -52,7 +52,9 @@ bool live_camp_anchor(const CampObs& seen, cambc::vec2& anchor)
 void warding::maybe_place(const Obs& obs)
 {
     static std::uint32_t next_check_round = 1;
-    if (!obs.self_alive || obs.round < next_check_round
+    // Wards defend a carrier's route home (v17): with an empty bag the
+    // lookahead buys nothing a death wouldn't already cost.
+    if (!obs.self_alive || obs.round < next_check_round || obs.self_gems == 0
         || cambc::fuel_remaining() < 40000 || cambc::constants::active_wards == 0)
         return;
 
