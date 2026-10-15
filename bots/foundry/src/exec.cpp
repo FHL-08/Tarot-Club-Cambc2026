@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <variant>
 #include <vector>
+#include "camp_scoring.h"
 #include "econ.h"
 #include "ledger.h"
 #include "nav.h"
@@ -593,16 +594,94 @@ std::optional<exec::Action> attack_in_range(const cambc::bitboard& attack_tiles,
     return exec::Attack{ best, exec::Attack::Kind::camp };
 }
 
+struct FarmTargets {
+    std::array<camp_scoring::Target, camp_scoring::max_targets> values{};
+    std::array<char, camp_scoring::max_targets> in_reach{};
+    std::size_t count = 0;
+
+    // Only the populated prefix represents observed monsters. The unused
+    // array tail must never become imaginary zero-coordinate farming targets.
+    std::span<const camp_scoring::Target> view() const { return {values.data(), count}; }
+};
+
+// Reuse the pre-action visibility snapshot, then keep a bounded set of
+// living members of the chosen group, putting legal centres before
+// out-of-range splash victims. A distant prefix must not hide every legal
+// shot on big packs. One reach host call per member — bitboard is_set
+// crossings are the dominant fuel cost of this scan, so the flag rides
+// along instead of being re-queried per consumer. This does not perform
+// attacks; the cached HP stays valid until apply() commits the action.
+FarmTargets farm_targets(int active_group, const cambc::bitboard& reach)
+{
+    FarmTargets out;
+    std::array<camp_scoring::Target, camp_scoring::max_targets> far;
+    std::size_t far_count = 0;
+    for (const auto& c : visible_camps())
+    {
+        if (!camp_scoring::can_score(cambc::fuel_remaining())) break;
+        if (c.health <= 0 || group_of(c.spawn) != active_group) continue;
+        const camp_scoring::Target t{c.pos.x, c.pos.y, c.health, c.strength};
+        if (reach.is_set(c.pos))
+        {
+            if (out.count == out.values.size()) continue;
+            out.in_reach[out.count] = 1;
+            out.values[out.count++] = t;
+        }
+        else if (far_count < far.size())
+        {
+            far[far_count++] = t;
+        }
+        if (out.count == out.values.size() && far_count == far.size()) break;
+    }
+    for (std::size_t i = 0; i < far_count && out.count < out.values.size(); ++i)
+        out.values[out.count++] = far[i];
+    return out;
+}
+
+// Waking a different pack can turn a profitable clear into a retreat. Reject
+// blast centres touching another group's public spawn tiles, even if hidden.
+// Also check live positions of visible displaced camps. This is conservative:
+// it does not claim that unseen monsters are alive or reveal their positions.
+bool cast_area_safe(int active_group, cambc::vec2 centre, float radius)
+{
+    if (radius < 0 || radius > camp_scoring::max_area_radius) return false;
+    const int reach = static_cast<int>(radius);
+    const int width = cambc::map::width(), height = cambc::map::height();
+    for (int y = std::max(0, centre.y - reach); y <= std::min(height - 1, centre.y + reach); ++y)
+        for (int x = std::max(0, centre.x - reach); x <= std::min(width - 1, centre.x + reach); ++x)
+            if (camp_scoring::foreign_group(group_of({x, y}), active_group)) return false;
+    for (const auto& c : visible_camps())
+        if (c.health > 0 && camp_scoring::foreign_group(group_of(c.spawn), active_group)
+            && c.pos.chebyshev_distance(centre) <= radius) return false;
+    return true;
+}
+
 // A ready damage/cc payload on the engaged group out-damages a basic
 // swing, and stunned members skip their retaliation — the planner's kit
 // dps already prices this in (burst amortized over the 8-round cooldown),
 // so a runtime that never casts clears slower than the gate believes.
 // Restricted to the active target: focused-fire, never wake a bystander.
+// Targets are picked by camp_scoring's value model (kill credit, stun
+// denial, blast-centre optimisation behind a foreign-group guard) while
+// the fuel reserve holds; below it the first legal shot fires as before.
 std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
 {
-    const auto& me = turn::self();
     if (!turn::self_state().contains(cambc::champion_state::can_cast)) return std::nullopt;
     const auto& abilities = turn::abilities();
+    auto first_hit = [&](std::uint8_t slot, const cambc::bitboard& tiles,
+                         bool ground, float radius = 0) -> std::optional<exec::Cast>
+    {
+        for (const auto& c : visible_camps())
+            if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos)
+                && (!ground || radius <= 0 || cast_area_safe(g, c.pos, radius)))
+            {
+                mem.last_cast_slot = slot;
+                mem.last_cast_round = round;
+                return exec::Cast{ slot, c.pos, ground };
+            }
+        return std::nullopt;
+    };
+    const bool scored = camp_scoring::can_score(cambc::fuel_remaining());
     for (std::uint8_t slot = 0; slot < 2; ++slot)
     {
         if (mem.cast_banned[slot]) continue;
@@ -613,14 +692,129 @@ std::optional<exec::Cast> camp_cast(int g, std::uint32_t round)
         if (!turn::slot_targets(slot).contains(cambc::ability_target_mask::camps) && !ground)
             continue;
         const cambc::bitboard& tiles = turn::slot_reach(slot);
-        for (const auto& c : visible_camps())
-            if (c.health > 0 && group_of(c.spawn) == g && tiles.is_set(c.pos))
+        if (!scored)
+        {
+            if (const auto cast = first_hit(slot, tiles, ground)) return cast;
+            continue;
+        }
+        if (!camp_scoring::can_score(cambc::fuel_remaining())) break;
+        // Includes caster items/passives per the SDK. Do not multiply item
+        // bonuses again. HP clipping/one-tick CC credit remain estimates.
+        const float damage = ab.damage_amount();
+        const auto targets = farm_targets(g, tiles);
+        // Rank within the slot only: the earliest ready slot commits, as
+        // the unscored path did — a cross-slot argmax lets an area splash
+        // outrank a point kill and the delayed kill costs retaliation.
+        float slot_best = -1;
+        cambc::vec2 slot_tile{};
+        if (!ground)
+        {
+            for (std::size_t i = 0; i < targets.count; ++i)
+            {
+                if (!camp_scoring::can_score(cambc::fuel_remaining())) break;
+                if (!targets.in_reach[i]) continue;
+                const auto& target = targets.values[i];
+                const float score = camp_scoring::cast_value(target, damage, ab.is_cc());
+                if (score <= 0) continue;
+                if (score > slot_best
+                    || (score == slot_best
+                        && (target.x < slot_tile.x
+                            || (target.x == slot_tile.x && target.y < slot_tile.y))))
+                {
+                    slot_best = score;
+                    slot_tile = {target.x, target.y};
+                }
+            }
+            if (slot_best > 0)
             {
                 mem.last_cast_slot = slot;
                 mem.last_cast_round = round;
-                return exec::Cast{ slot, c.pos, ground };
+                return exec::Cast{ slot, slot_tile, false };
             }
+            continue;
+        }
+        float radius = 0;
+        if (ab.is_aoe_damage()) radius = ab.get<cambc::ability_aoe_damage>().radius;
+        // The SDK CC payload has no radius. GameRules' Ryth slot 0 is an
+        // explicit radius-one area stun; do not guess for unknown kits.
+        else if (ab.is_cc() && turn::self().champion_name() == cambc::champion_type::ryth) radius = 1;
+        else continue;
+        const float range = std::visit([](const auto& info) -> float {
+            if constexpr (requires { info.range; }) return info.range;
+            return 0.0f;
+        }, ab.info().value());
+        // Centre legality by Chebyshev arithmetic: slot_reach drew exactly
+        // this disc, and each is_set is a host call a ~70-centre scan
+        // cannot spend per candidate.
+        const cambc::vec2 self_pos = turn::self().position();
+        const int box = static_cast<int>(radius);
+        static std::vector<std::uint32_t> marks;
+        static std::uint32_t stamp = 0;
+        const int width = cambc::map::width(), height = cambc::map::height();
+        if (marks.size() != static_cast<std::size_t>(width) * height)
+            marks.assign(static_cast<std::size_t>(width) * height, 0);
+        ++stamp;
+        for (const auto& member : targets.view())
+        {
+            if (!camp_scoring::can_score(cambc::fuel_remaining())) break;
+            for (int dy = -box; dy <= box; ++dy)
+                for (int dx = -box; dx <= box; ++dx)
+                {
+                    const cambc::vec2 centre{ member.x + dx, member.y + dy };
+                    if (centre.x < 0 || centre.y < 0 || centre.x >= width || centre.y >= height)
+                        continue;
+                    const std::size_t mark = static_cast<std::size_t>(centre.y) * width + centre.x;
+                    if (marks[mark] == stamp) continue;
+                    marks[mark] = stamp;
+                    if (self_pos.chebyshev_distance(centre) > range) continue;
+                    if (dx != 0 || dy != 0)
+                    {
+                        int clipped = 0;
+                        for (const auto& t : targets.view())
+                            if (camp_scoring::in_area(centre.x, centre.y, t, radius)) ++clipped;
+                        if (clipped < 2) continue;
+                    }
+                    if (!cast_area_safe(g, centre, radius)) continue;
+                    const float score = camp_scoring::area_value(targets.view(), centre.x, centre.y,
+                        radius, damage, ab.is_cc());
+                    if (score <= 0) continue;
+                    if (score > slot_best
+                        || (score == slot_best
+                            && (centre.x < slot_tile.x
+                                || (centre.x == slot_tile.x && centre.y < slot_tile.y))))
+                    {
+                        slot_best = score;
+                        slot_tile = centre;
+                    }
+                }
+        }
+        if (slot_best > 0)
+        {
+            mem.last_cast_slot = slot;
+            mem.last_cast_round = round;
+            return exec::Cast{ slot, slot_tile, true };
+        }
     }
+    // The scorer may exhaust its reserve mid-scan or find only
+    // zero-value shots; the cast itself is still worth a plain swing.
+    if (scored)
+        for (std::uint8_t slot = 0; slot < 2; ++slot)
+        {
+            if (mem.cast_banned[slot]) continue;
+            const auto& ab = abilities[slot];
+            if (!turn::slot_ready(slot) || (!ab.is_damage() && !ab.is_aoe_damage() && !ab.is_cc()))
+                continue;
+            const bool ground = turn::slot_targets(slot).contains(cambc::ability_target_mask::ground);
+            if (!turn::slot_targets(slot).contains(cambc::ability_target_mask::camps) && !ground)
+                continue;
+            // The fallback's ground blast lands on the member's own tile;
+            // keep the same foreign-group guard or the rescue can wake the
+            // pack the scorer just refused to touch.
+            float fb_radius = 0;
+            if (ab.is_aoe_damage()) fb_radius = ab.get<cambc::ability_aoe_damage>().radius;
+            else if (ab.is_cc() && turn::self().champion_name() == cambc::champion_type::ryth) fb_radius = 1;
+            if (const auto cast = first_hit(slot, turn::slot_reach(slot), ground, fb_radius)) return cast;
+        }
     return std::nullopt;
 }
 
