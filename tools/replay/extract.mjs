@@ -47,12 +47,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (!files.length) { console.error('no replays found'); process.exit(1); }
   ensureAssets(fs.readFileSync(files[0]).subarray(0, 2).toString('latin1') === 'PK' ? (() => { const t = path.join(outDir, '.probe.repl26a'); fs.mkdirSync(outDir, { recursive: true }); fs.writeFileSync(t, replayBytes(files[0])); return t; })() : files[0]);
   fs.mkdirSync(outDir, { recursive: true });
-  const E = await openEngine();
   let done = 0;
   for (const f of files) {
     const out = path.join(outDir, path.basename(f).replace(/\.(zip|repl26a)$/, '.json'));
     if (fs.existsSync(out)) continue;
-    try { fs.writeFileSync(out, JSON.stringify(extract(E, f))); done++; } catch (e) { console.error('FAIL', f, e.message); }
+    try { const E = await openEngine(replayBytes(f)); fs.writeFileSync(out, JSON.stringify(extract(E, f))); done++; } catch (e) { console.error('FAIL', f, e.message); }
   }
   fs.rmSync(path.join(outDir, '.probe.repl26a'), { force: true });
   console.log(`extracted ${done}/${files.length} -> ${outDir}`);
