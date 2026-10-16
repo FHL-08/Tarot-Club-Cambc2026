@@ -16,4 +16,5 @@ sdk/
 
 # Replay tool: visualiser assets pulled from the local cambc view server
 tools/replay/.cache/
+tools/replay/.cache_v2/
 __pycache__/

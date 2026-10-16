@@ -9,18 +9,32 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cache = path.join(here, '.cache');
-const pick = (re) => fs.existsSync(cache) && fs.readdirSync(cache).find((f) => re.test(f));
+const cacheV2 = path.join(here, '.cache_v2');
+const pick = (re, dir = cache) => fs.existsSync(dir) && fs.readdirSync(dir).find((f) => re.test(f));
 
 export function ensureAssets(anyReplay) {
   if (pick(/^PanelChrome-.*\.js$/) && pick(/^v0_0_1-.*\.wasm$/)) return;
   execFileSync(path.join(here, 'assets.sh'), [anyReplay], { stdio: 'inherit' });
 }
 
-export async function openEngine() {
+// Replays carry a format version at byte 10: 1 = engine v0_0_1 (.cache, local cambc view),
+// 2 = engine v0_0_2 (.cache_v2, pulled from the deployed /service/tools/visualiser release).
+const engineDir = (bytes) => (bytes && bytes[10] === 2 ? cacheV2 : cache);
+
+const engines = new Map();
+export async function openEngine(bytes = null) {
+  const dir = engineDir(bytes);
+  if (engines.has(dir)) return engines.get(dir);
+  const E = await openEngineFresh(dir);
+  engines.set(dir, E);
+  return E;
+}
+
+async function openEngineFresh(dir) {
   const { WASI } = await import('node:wasi');
-  const PC = await import(pathToFileURL(path.join(cache, pick(/^PanelChrome-.*\.js$/))).href);
+  const PC = await import(pathToFileURL(path.join(dir, pick(/^PanelChrome-.*\.js$/, dir))).href);
   const wasi = new WASI({ version: 'preview1', args: [], env: {}, returnOnExit: true });
-  const mod = await WebAssembly.compile(fs.readFileSync(path.join(cache, pick(/^v0_0_1-.*\.wasm$/))));
+  const mod = await WebAssembly.compile(fs.readFileSync(path.join(dir, pick(/^v0_0_1-.*\.wasm$|^v0_0_2-.*\.wasm$/, dir))));
   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport });
   wasi.initialize(inst);
   const X = inst.exports;

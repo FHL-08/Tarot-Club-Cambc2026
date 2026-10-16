@@ -80,12 +80,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (!files.length) { console.error('no replays found'); process.exit(1); }
   ensureAssets(files[0]);
   fs.mkdirSync(outDir, { recursive: true });
-  const E = await openEngine();
   let done = 0;
   for (const f of files) {
     const out = path.join(outDir, path.basename(f).replace(/\.(zip|repl26a)$/, '.vision.json'));
     if (fs.existsSync(out)) continue;
-    try { fs.writeFileSync(out, JSON.stringify(extractVision(E, f))); done++; } catch (e) { console.error('FAIL', f, e.message); }
+    try { const E = await openEngine(replayBytes(f)); fs.writeFileSync(out, JSON.stringify(extractVision(E, f))); done++; } catch (e) { console.error('FAIL', f, e.message); }
   }
   console.log(`vision-extracted ${done}/${files.length} -> ${outDir}`);
 }
