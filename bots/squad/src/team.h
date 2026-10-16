@@ -2,14 +2,14 @@
 // The team's 8 bytes of shared memory. Every champion runs its own copy of the
 // bot, so this is the only way they can coordinate during a match.
 //
-// Two squads farm at once: Ryth + Tavi + Willow follow Ryth, and
-// Vendetta + Prism farm the camp Vendetta picks.
+// One pack farms at once: every champion converges on the camp the pack leader
+// publishes as the objective.
 //
-//   byte 0-1  objective tile (x, y): the camp Vendetta's squad is farming, or
+//   byte 0-1  objective tile (x, y): the camp the pack is farming, or
 //             the map centre when there is nothing to farm (hunting)
 //   byte 2    objective stamp, +128 when hunting
-//   byte 3-4  Ryth's position (his squad's anchor)
-//   byte 5    Ryth stamp, +128 when his squad is hunting
+//   byte 3-4  Ryth's position (the pack leader's anchor)
+//   byte 5    Ryth stamp, +128 when the pack is hunting
 //   byte 6    fight alarm stamp: Ryth was attacked, or the team initiated;
 //             +128 once Stellar or Varg owns an emblem (mid game)
 //   byte 7    danger alarm stamp: a teammate is hurt and under attack;
