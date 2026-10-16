@@ -37,6 +37,19 @@ constexpr int join_capture_range = 6;
 // Fall back instead of fighting when nearby enemies are this much stronger.
 constexpr float outmatched_ratio = 1.3f;
 
+// Chase a foe only at or above this health share; below it the champion
+// kite-farms — hits what is in range while orbiting its squad's camp.
+constexpr float engage_health = 0.6f;
+// Yield-park: hold a cleared camp through a respawn of at most this many
+// rounds, or while the wait still beats the next-best camp by park_margin.
+constexpr int park_wait = 20;
+constexpr int park_margin = 10;
+// Kite-farm: orbit tiles sit within this of the owned camp, this far from foes.
+constexpr int kite_camp_radius = 4;
+constexpr int kite_foe_radius = 4;
+// Followers park on fixed sectors this far off the anchor — a squad-level
+// pack ~8-12 tiles mean pairwise, not a blob.
+
 // Game phases (the user's plan). Early: farm and feed Stellar, only push away
 // enemies that come into reach. Mid (Stellar or Varg owns an emblem): hit
 // enemies within mid_leash, then go back to farming. Late (Stellar owns three
@@ -660,6 +673,7 @@ std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
         }
     std::optional<vec2> best;
     double best_value = -1;
+    double best_turns = 0;
     // Fallback when every group is respawning: the one back soonest after we
     // could walk there, so the squad waits beside it instead of wandering.
     std::optional<vec2> soonest;
@@ -706,8 +720,26 @@ std::optional<vec2> choose_camp(vec2 from, std::optional<vec2> current,
         if (value > best_value) {
             best_value = value;
             best = closest;
+            best_turns = turns;
         }
     }
+    // Yield-park: a squad already holding a cleared camp waits out a short
+    // respawn on its ring instead of relocating — park when the wait fits
+    // park_wait, or when it still beats the next-best camp by park_margin.
+    if (current)
+        if (const auto* g = group_at(*current)) {
+            const auto i = static_cast<std::size_t>(g - groups().data());
+            const int left = ready_round()[i] - round;
+            if (left > 0 && taken_until()[i] <= round) {
+                int alt = std::numeric_limits<int>::max();
+                if (best)
+                    alt = static_cast<int>(best_turns);
+                if (soonest)
+                    alt = std::min(alt, soonest_wait + dist(from, *soonest));
+                if (left <= park_wait || left <= alt - park_margin)
+                    return current;
+            }
+        }
     return best ? best : soonest;
 }
 
@@ -857,6 +889,16 @@ bool join_capture() {
 // own spawn heal to full every turn, so walking in there only feeds them kills.
 vec2 map_centre() {
     return {cambc::map::width() / 2, cambc::map::height() / 2};
+}
+
+// Followers hold a loose ring (3-5 tiles) off the anchor — squad-level pack,
+// not a blob stacked on one tile.
+void hold_sector(vec2 anchor) {
+    const auto here = cambc::self().position();
+    const auto band = ring(anchor, 3, 5);
+    if (band.is_set(here))
+        return;
+    step_towards(band);
 }
 
 // ---------------------------------------------------------------- shopping
@@ -1123,6 +1165,75 @@ const char* champion_label(cambc::champion_type t); // scouting section below
 
 // ==================================================================== Bot
 
+// Squad A's anchor tile. While Ryth walks a bag to an altar (or is walking
+// back) the anchor stays on the squad's camp — one tribute trip never pulls
+// the whole squad off its farm.
+vec2 Bot::squad_anchor() {
+    auto& me = cambc::self();
+    if (group_at(me.position()) != nullptr)
+        banking_trip = false;
+    else if (me.gem_count() > 0)
+        banking_trip = true;
+    if (banking_trip && farm_target)
+        return *farm_target;
+    return me.position();
+}
+
+// The camp this champion's squad is working: its own farm target, else the
+// group containing the squad leader's shared tile.
+std::optional<vec2> Bot::owned_camp() {
+    if (farm_target)
+        return farm_target;
+    if (squad_a) {
+        if (const auto a = team_memory::anchor(); a && !a->hunt && group_at(a->tile))
+            return a->tile;
+    } else if (const auto o = team_memory::objective(); o && !o->hunt && group_at(o->tile)) {
+        return o->tile;
+    }
+    return std::nullopt;
+}
+
+// Low health with a foe near: never channel — hit what's in range and keep
+// moving on the owned camp's far side, out of the foe's reach. Enemies on
+// their own spawn heal every turn, so they can't be fought and aren't chased.
+// Falls back to walking home when there is no camp to orbit.
+void Bot::kite_farm(const std::vector<cambc::champion>& foes, const Abilities& abilities) {
+    auto& me = cambc::self();
+    const auto here = me.position();
+    const auto& their_spawn = cambc::map::spawn_region(team::enemy);
+    std::vector<cambc::champion> fight;
+    for (const auto& e : foes)
+        if (alive(e) && !their_spawn.is_set(safe_pos(e, vec2{-1, -1})))
+            fight.push_back(e);
+    const auto* reset = find_ability(abilities, is_reset);
+    if (!attack_enemies(fight, reset))
+        hit_camps(farm_target, abilities);
+    // Orbiting beside a pursuer that can already reach us only drags the
+    // chase out: break for spawn and heal instead.
+    if (nearest_enemy_distance(foes, here) <= kite_foe_radius) {
+        step_towards(cambc::map::spawn_region(team::ally));
+        return;
+    }
+    const auto camp = owned_camp();
+    if (camp)
+        if (const auto* g = group_at(*camp)) {
+            bitboard orbit;
+            orbit.clear();
+            for (const auto t : g->spawns)
+                orbit |= ring(t, 1, kite_camp_radius);
+            orbit &= ~g->tiles;
+            for (const auto& e : foes)
+                orbit &= ~square(safe_pos(e, here), kite_foe_radius);
+            if (orbit.is_set(here))
+                return; // already orbiting safely — hold
+            if (!orbit.is_empty()) {
+                step_towards(orbit);
+                return;
+            }
+        }
+    step_towards(cambc::map::spawn_region(team::ally));
+}
+
 void Bot::init() {
     initialised = true;
     auto& me = cambc::self();
@@ -1250,8 +1361,9 @@ bool Bot::survive() {
                 return true;
             }
 
-    // Otherwise run home; recall only once out of reach.
-    step_towards(cambc::map::spawn_region(team::ally));
+    // Kite-farm around the owned camp; running home through a chasing enemy
+    // dies mid-field and a recall channel only breaks.
+    kite_farm(enemies, me.abilities());
     return true;
 }
 
@@ -1489,7 +1601,9 @@ void Bot::farmer_turn() {
     const auto abilities = me.abilities();
     const auto* reset = find_ability(abilities, is_reset);
     const auto* shield = find_ability(abilities, is_shield);
-    const bool engage = !ctx.enemies.empty();
+    const bool engage = !ctx.enemies.empty()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1505,6 +1619,11 @@ void Bot::farmer_turn() {
             return;
         step_towards(ring(at, 1, 1));
         attack_with_reset(*target, reset);
+        return;
+    }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
         return;
     }
 
@@ -1643,7 +1762,7 @@ void Bot::play_turn() {
     if (!visible_enemies().empty())
         enemy_seen_round = cambc::round_number();
     if (role == Role::tank)
-        team_memory::set_anchor(me.position(), hunting);
+        team_memory::set_anchor(squad_anchor(), hunting);
     if (me.is_recalling() || me.is_submitting_gems() || me.is_teleporting())
         return;
 
@@ -1653,7 +1772,7 @@ void Bot::play_turn() {
     update_ledger();
     choose_objective();
     if (role == Role::tank)
-        team_memory::set_anchor(me.position(), hunting);
+        team_memory::set_anchor(squad_anchor(), hunting);
     burst(); // mingstudy-ttsburst: spend ready spells on enemies in reach first
     if (bank())
         return;
@@ -1683,7 +1802,10 @@ void Bot::tank_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
 
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    // >=60% hp to chase a fight; below that still defend a foe already in reach.
+    const bool engage = !ctx.enemies.empty() && fighting_back()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1698,6 +1820,11 @@ void Bot::tank_turn() {
                 keep_distance(safe_pos(*target, me.position()), 1, 1);
             attack_enemies(ctx.enemies, reset);
         }
+        return;
+    }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
         return;
     }
 
@@ -1724,7 +1851,10 @@ void Bot::fighter_turn() {
     // Vendetta keeps securing her camp during a fight unless a teammate is in
     // danger, an enemy is on top of her, or there is no camp to secure.
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    // >=60% hp to chase a fight; below that still defend a foe already in reach.
+    const bool engage = !ctx.enemies.empty() && fighting_back()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1754,6 +1884,11 @@ void Bot::fighter_turn() {
         attack_with_reset(*target, reset);
         return;
     }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
+        return;
+    }
 
     // Farming: lead her squad to the chosen camp (choose_objective already ran).
     if (!farm_target) {
@@ -1774,7 +1909,10 @@ void Bot::marksman_turn() {
     const auto* reset = find_ability(abilities, is_reset);
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    // >=60% hp to chase a fight; below that still defend a foe already in reach.
+    const bool engage = !ctx.enemies.empty() && fighting_back()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1792,6 +1930,11 @@ void Bot::marksman_turn() {
             keep_distance(safe_pos(*target, me.position()), 3, 3);
         return;
     }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
+        return;
+    }
 
     // Farming: share cleared camps, shoot what Ryth has woken, stay just behind him.
     if (join_capture())
@@ -1803,7 +1946,7 @@ void Bot::marksman_turn() {
     if (ctx.anchor) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        step_towards(ring(*ctx.anchor, 1, 2));
+        hold_sector(*ctx.anchor);
         return;
     }
     if (farm_target) // Ryth is dead or recalling: farm alone
@@ -1844,7 +1987,10 @@ void Bot::support_turn() {
 
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    // >=60% hp to chase a fight; below that still defend a foe already in reach.
+    const bool engage = !ctx.enemies.empty() && fighting_back()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1863,6 +2009,11 @@ void Bot::support_turn() {
             step_towards(safe);
         return;
     }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
+        return;
+    }
 
     // Farming: share cleared camps, help on woken camps, back line behind Ryth.
     if (join_capture())
@@ -1874,7 +2025,7 @@ void Bot::support_turn() {
     if (ctx.anchor) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        step_towards(ring(*ctx.anchor, 2, 3));
+        hold_sector(*ctx.anchor);
         return;
     }
     if (farm_target) // Ryth is dead or recalling: farm alone
@@ -1892,7 +2043,10 @@ void Bot::mage_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     // On 5-champion maps Prism opens the fight when hunting.
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    // >=60% hp to chase a fight; below that still defend a foe already in reach.
+    const bool engage = !ctx.enemies.empty() && fighting_back()
+        && (me.health() >= me.max_health() * engage_health
+            || nearest_enemy_distance(ctx.enemies, me.position()) <= 2);
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
@@ -1928,6 +2082,11 @@ void Bot::mage_turn() {
             keep_distance(safe_pos(*target, me.position()), 2, 4);
         return;
     }
+    if (!ctx.enemies.empty() && me.health() < me.max_health() * 0.45f
+        && nearest_enemy_distance(ctx.enemies, me.position()) <= 6) {
+        kite_farm(ctx.enemies, abilities);
+        return;
+    }
 
     // Farming: share cleared camps, hit camps the squad leader has woken, and
     // stay a step behind the leader so the camp targets the leader first.
@@ -1944,13 +2103,16 @@ void Bot::mage_turn() {
     if (squad_a && ctx.anchor) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        step_towards(ring(*ctx.anchor, 1, 2));
+        hold_sector(*ctx.anchor);
         return;
     }
     if (!squad_a && ctx.objective) {
         if (hit_camps(std::nullopt, abilities))
             return;
-        step_towards(ring(ctx.objective->tile, ctx.hunt ? 3 : 2, ctx.hunt ? 5 : 3));
+        if (ctx.hunt)
+            step_towards(ring(ctx.objective->tile, 3, 5));
+        else
+            hold_sector(ctx.objective->tile);
         return;
     }
     if (farm_target) // the squad leader is dead or recalling: farm alone

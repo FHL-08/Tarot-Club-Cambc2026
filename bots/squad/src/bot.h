@@ -18,6 +18,7 @@ class Bot {
     bool hunting = false;                   // Ryth: no camp to farm, squad hunts
     bool squad_a = true;                    // follows Ryth (A) or the objective (B)
     std::uint32_t enemy_seen_round = 0;     // last round an enemy champion was in sight
+    bool banking_trip = false;              // Ryth is away tributing; his squad holds the camp
 
     void init();
     void shop();
@@ -27,6 +28,9 @@ class Bot {
     bool shopping_trip();
     bool fighting_back() const;
     bool farm_nearby_wolf(const std::array<cambc::ability, 2>& abilities, std::optional<cambc::vec2> leader);
+    cambc::vec2 squad_anchor();
+    std::optional<cambc::vec2> owned_camp();
+    void kite_farm(const std::vector<cambc::champion>& foes, const std::array<cambc::ability, 2>& abilities);
     void choose_objective();
 
     void tank_turn();
