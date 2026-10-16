@@ -4,6 +4,7 @@
 // this champion's role. Roles fight when engaged and farm in formation otherwise.
 #include <cambc.h>
 #include "bot.h"
+#include "gates.h"
 #include "team.h"
 #include <algorithm>
 #include <array>
@@ -1097,6 +1098,26 @@ bool should_retreat(const Context& ctx) {
     return enemies - allies >= outnumbered_by;
 }
 
+// atk5 veto: give ground to the nearest foe, then the farming path still
+// runs — the veto never starts a channel (a foe within 4 tiles interrupts
+// recall anyway).
+void kite_from(const std::vector<cambc::champion>& enemies) {
+    auto& me = cambc::self();
+    if (!me.can_move() || enemies.empty())
+        return;
+    const auto here = me.position();
+    int d = 1000;
+    vec2 nearest = here;
+    for (const auto& e : enemies) {
+        const auto at = safe_pos(e, here);
+        if (dist(here, at) < d) {
+            d = dist(here, at);
+            nearest = at;
+        }
+    }
+    step_towards(ring(nearest, d + 1, d + 3));
+}
+
 // Fall back to the nearest teammate who is not under attack, else to base.
 void retreat(const Context& ctx) {
     const auto here = cambc::self().position();
@@ -1233,7 +1254,7 @@ bool Bot::survive() {
 
     const auto enemies = visible_enemies();
     const bool threatened = nearest_enemy_distance(enemies, me.position()) <= 5;
-    if (!threatened)
+    if (!threatened && gates::allow_channel())
         return attempt([&] { me.recall(); return true; });
 
     // Vendetta falls back to Willow for healing when the way is clear.
@@ -1309,7 +1330,8 @@ bool Bot::bank() {
     int best_cost = std::numeric_limits<int>::max();
     for (const auto altar : cambc::map::altars().positions()) {
         const bool locked = enemy_locks.is_set(altar);
-        if (!locked && dist(here, altar) <= cambc::constants::submit_gems_range)
+        if (!locked && dist(here, altar) <= cambc::constants::submit_gems_range
+            && gates::allow_channel())
             return attempt([&] { me.submit_gems(altar); return true; });
         if (locked && dist(here, altar) <= range)
             if (const auto l = enemy_lock_at(altar); l && attack_lock(*l))
@@ -1354,7 +1376,7 @@ bool Bot::shopping_trip() {
         return false;
     if (team_memory::fight_alarm() || !visible_enemies().empty())
         return false;
-    return attempt([&] { me.recall(); return true; });
+    return gates::allow_channel() && attempt([&] { me.recall(); return true; });
 }
 
 // Each squad leader picks a camp. Squad B's leader shares hers as the
@@ -1489,10 +1511,14 @@ void Bot::farmer_turn() {
     const auto abilities = me.abilities();
     const auto* reset = find_ability(abilities, is_reset);
     const auto* shield = find_ability(abilities, is_shield);
-    const bool engage = !ctx.enemies.empty();
+    bool engage = !ctx.enemies.empty();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
     if (engage) {
         const auto target = top_threat(ctx.enemies);
@@ -1683,10 +1709,14 @@ void Bot::tank_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
 
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    bool engage = !ctx.enemies.empty() && fighting_back();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
 
     if (engage) {
@@ -1724,10 +1754,14 @@ void Bot::fighter_turn() {
     // Vendetta keeps securing her camp during a fight unless a teammate is in
     // danger, an enemy is on top of her, or there is no camp to secure.
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    bool engage = !ctx.enemies.empty() && fighting_back();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
 
     if (engage) {
@@ -1774,10 +1808,14 @@ void Bot::marksman_turn() {
     const auto* reset = find_ability(abilities, is_reset);
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    bool engage = !ctx.enemies.empty() && fighting_back();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
 
     if (engage) {
@@ -1844,10 +1882,14 @@ void Bot::support_turn() {
 
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    bool engage = !ctx.enemies.empty() && fighting_back();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
     const auto* attack_reset = healed ? nullptr : reset;
     if (engage) {
@@ -1892,10 +1934,14 @@ void Bot::mage_turn() {
     const int nearest = nearest_enemy_distance(ctx.enemies, me.position());
     // On 5-champion maps Prism opens the fight when hunting.
     (void)nearest;
-    const bool engage = !ctx.enemies.empty() && fighting_back();
+    bool engage = !ctx.enemies.empty() && fighting_back();
     if (should_retreat(ctx)) {
         retreat(ctx);
         return;
+    }
+    if (engage && gates::veto_fight()) {
+        kite_from(ctx.enemies);
+        engage = false;
     }
 
     if (engage) {
